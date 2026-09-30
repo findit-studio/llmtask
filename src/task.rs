@@ -160,14 +160,17 @@ mod json {
     #[error("schema violation: top-level key appears more than once: {0:?}")]
     DuplicateField(SmolStr),
     /// JSON parsed but one or more schema fields are unusable: a required
-    /// field absent or present as JSON `null`, or any listed field (required
+    /// field absent or present as JSON `null`, any listed field (required
     /// or optional) present with a JSON type its schema entry can't satisfy
-    /// (e.g. a number where a string or array of strings is expected). All
-    /// three cases are folded into one variant because the schema requires
-    /// every listed field to carry a string or array-of-strings value —
-    /// never null, and never a type the field's shape can't hold — so a
+    /// (e.g. a number where a string or array of strings is expected), or a
+    /// value over a cap its schema entry declares (`maxLength`,
+    /// `maxItems`). All four cases are folded into one variant because the
+    /// schema requires every listed field to carry a string or
+    /// array-of-strings value within its caps — never null, never a type
+    /// the field's shape can't hold, never longer than declared — so a
     /// decoder that violates any of them has drifted the same way from the
-    /// caller's perspective: the field's value can't be used.
+    /// caller's perspective: the field's value can't be used. A task names
+    /// an over-cap field here rather than truncating the value to fit.
     #[error("schema violation: required fields missing, null, or invalid: {0:?}")]
     MissingFields(Vec<&'static str>),
     /// JSON parsed as an object, but it carries one or more keys outside

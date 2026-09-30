@@ -46,6 +46,16 @@ pub enum Grammar {
   /// JSON Schema (RFC 8927-style draft, as accepted by serde_json
   /// `Value`). The widest-compatible variant; all current engines
   /// accept it. Gated on the `json` feature.
+  ///
+  /// An engine that serves this crate's own JSON task,
+  /// [`ImageAnalysisTask`](crate::image_analysis::ImageAnalysisTask),
+  /// must honour every keyword its schema uses: `type`, `properties`,
+  /// `required`, `additionalProperties: false`, `items`, `maxLength`
+  /// (a string's length in Unicode scalar values) and `maxItems` (an
+  /// array's element count). The task's `parse` checks the answer
+  /// against each of them again and refuses a violation by name, so an
+  /// engine that ignores a keyword surfaces as a parse error rather than
+  /// as silently over-long or reshaped output.
   #[cfg(feature = "json")]
   #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
   JsonSchema(serde_json::Value),

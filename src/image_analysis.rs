@@ -348,7 +348,7 @@ mod tests {
 
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-pub use image_analysis_task::{Extension, ImageAnalysisTask};
+pub use image_analysis_task::{Extension, ImageAnalysisTask, UnknownExtension};
 
 /// The `ImageAnalysisTask` implementation. Grouped in its own private
 /// module (mirroring `task::json`'s pattern) so the whole surface —
@@ -361,6 +361,7 @@ mod image_analysis_task {
     cell::RefCell,
     fmt::{self, Write as _},
     num::NonZeroUsize,
+    str::FromStr,
   };
 
   use serde::de::{self, Deserializer as _, MapAccess, Visitor};
@@ -483,6 +484,53 @@ Rules:
   /// is in none of the three: an answer that carries it anyway is refused
   /// as [`JsonParseError::UnknownFields`], and the parsed [`ImageAnalysis`]
   /// reads it as empty.
+  ///
+  /// # Names
+  ///
+  /// An extension's name is its field's JSON key, so a document can list
+  /// the extensions a deployment switches on (`["scene", "shot_type"]`).
+  /// Every road spells the same name: [`as_str`](Self::as_str) and
+  /// [`Display`](core::fmt::Display) write it, [`FromStr`](core::str::FromStr)
+  /// and [`TryFrom<&str>`](core::convert::TryFrom) read it back, and with the
+  /// `serde` feature [`Serialize`](serde::Serialize) and
+  /// [`Deserialize`](serde::Deserialize) carry it as a string. A name is read
+  /// exactly as written: another case, surrounding whitespace or `-` for `_`
+  /// is refused as [`UnknownExtension`], which names it, and so are
+  /// `description` and `tags`, which are not extensions.
+  ///
+  /// | Extension | Name | JSON type |
+  /// | --- | --- | --- |
+  /// | [`Scene`](Self::Scene) | `scene` | string |
+  /// | [`Subjects`](Self::Subjects) | `subjects` | array of strings |
+  /// | [`Objects`](Self::Objects) | `objects` | array of strings |
+  /// | [`Actions`](Self::Actions) | `actions` | array of strings |
+  /// | [`Emotion`](Self::Emotion) | `emotion` | array of strings |
+  /// | [`ShotType`](Self::ShotType) | `shot_type` | string |
+  /// | [`Lighting`](Self::Lighting) | `lighting` | array of strings |
+  /// | [`Categories`](Self::Categories) | `categories` | array of strings |
+  ///
+  /// [`Extension::ALL`] lists the extensions and [`Extension::NAMES`] their
+  /// names, both in this order.
+  ///
+  /// ```
+  /// use llmtask::image_analysis::{Extension, ImageAnalysisTask};
+  ///
+  /// // The names a deployment's document lists.
+  /// let extensions = ["scene", "shot_type"]
+  ///   .into_iter()
+  ///   .map(str::parse)
+  ///   .collect::<Result<Vec<Extension>, _>>()
+  ///   .expect("both are extension names");
+  /// assert_eq!(extensions, [Extension::Scene, Extension::ShotType]);
+  /// assert_eq!(Extension::ShotType.to_string(), "shot_type");
+  ///
+  /// let task = ImageAnalysisTask::new().with_extensions(extensions);
+  /// assert!(task.has_extension(Extension::ShotType));
+  ///
+  /// // Any other name is refused by name.
+  /// let err = "shot-type".parse::<Extension>().unwrap_err();
+  /// assert_eq!(err.name(), "shot-type");
+  /// ```
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
   pub enum Extension {
     /// `scene`: one short scene-category label.
@@ -521,8 +569,23 @@ Rules:
       Self::Categories,
     ];
 
-    /// The field's JSON key: the name the contract spells, which is also
-    /// the name of the field's [`ImageAnalysis`] accessor.
+    /// Every extension's name, in [`Extension::ALL`] order: `NAMES[i]` is
+    /// `ALL[i].as_str()`. These eight are the names
+    /// [`FromStr`](core::str::FromStr) reads; [`UnknownExtension`] lists
+    /// them.
+    pub const NAMES: [&'static str; 8] = {
+      let mut names = [""; 8];
+      let mut index = 0;
+      while index < names.len() {
+        names[index] = Self::ALL[index].as_str();
+        index += 1;
+      }
+      names
+    };
+
+    /// The extension's name: its field's JSON key, which is also the name
+    /// of the field's [`ImageAnalysis`] accessor. [`Display`](core::fmt::Display)
+    /// writes it and [`FromStr`](core::str::FromStr) reads it back.
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn as_str(&self) -> &'static str {
       self.field().key()
@@ -545,6 +608,121 @@ Rules:
     /// This extension's bit in `ImageAnalysisTask`'s extension mask.
     const fn bit(self) -> u8 {
       1 << (self as u8)
+    }
+  }
+
+  impl fmt::Display for Extension {
+    /// Writes the extension's name, [`Extension::as_str`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str(self.as_str())
+    }
+  }
+
+  impl FromStr for Extension {
+    type Err = UnknownExtension;
+
+    /// Reads the extension whose [`as_str`](Extension::as_str) is `name`
+    /// exactly, one of [`Extension::NAMES`]; any other `name` is refused as
+    /// [`UnknownExtension`].
+    fn from_str(name: &str) -> Result<Self, UnknownExtension> {
+      Self::ALL
+        .into_iter()
+        .find(|extension| extension.as_str() == name)
+        .ok_or_else(|| UnknownExtension {
+          name: SmolStr::new(name),
+        })
+    }
+  }
+
+  impl TryFrom<&str> for Extension {
+    type Error = UnknownExtension;
+
+    /// The same as [`FromStr`](core::str::FromStr).
+    fn try_from(name: &str) -> Result<Self, UnknownExtension> {
+      name.parse()
+    }
+  }
+
+  /// Serializes the extension as its name, a string.
+  #[cfg(feature = "serde")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+  impl serde::Serialize for Extension {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+      S: serde::Serializer,
+    {
+      serializer.serialize_str(self.as_str())
+    }
+  }
+
+  /// Deserializes an extension from its name, a string read as
+  /// [`FromStr`](core::str::FromStr) reads it. Any other string is refused
+  /// as an unknown variant, with the eight names expected, and a value that
+  /// is not a string as an invalid type.
+  #[cfg(feature = "serde")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+  impl<'de> serde::Deserialize<'de> for Extension {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+      D: serde::Deserializer<'de>,
+    {
+      deserializer.deserialize_str(NameVisitor)
+    }
+  }
+
+  /// [`Visitor`] behind [`Extension`]'s `Deserialize`: one extension name.
+  #[cfg(feature = "serde")]
+  struct NameVisitor;
+
+  #[cfg(feature = "serde")]
+  impl Visitor<'_> for NameVisitor {
+    type Value = Extension;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("an image-analysis extension name")
+    }
+
+    fn visit_str<E>(self, name: &str) -> Result<Extension, E>
+    where
+      E: de::Error,
+    {
+      name
+        .parse()
+        .map_err(|_| E::unknown_variant(name, &Extension::NAMES))
+    }
+  }
+
+  /// The error [`Extension`]'s [`FromStr`](core::str::FromStr) and
+  /// [`TryFrom<&str>`](core::convert::TryFrom) return for a name that is not
+  /// one of [`Extension::NAMES`]. It carries the name as given, and its
+  /// message names it and lists the eight.
+  #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+  #[error("unknown image-analysis extension {name:?}: expected one of {names}", names = NameList)]
+  pub struct UnknownExtension {
+    name: SmolStr,
+  }
+
+  impl UnknownExtension {
+    /// The refused name, exactly as it was given.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn name(&self) -> &str {
+      &self.name
+    }
+  }
+
+  /// [`Extension::NAMES`] as [`UnknownExtension`]'s message lists them:
+  /// comma-separated, in order.
+  struct NameList;
+
+  impl fmt::Display for NameList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      for (index, name) in Extension::NAMES.into_iter().enumerate() {
+        if index > 0 {
+          f.write_str(", ")?;
+        }
+        f.write_str(name)?;
+      }
+      Ok(())
     }
   }
 
@@ -2495,6 +2673,119 @@ Rules:
           "categories"
         ]
       );
+    }
+
+    // ===== the extension names =====
+
+    /// LAW: every extension's name reads back as that extension, through
+    /// `FromStr` and `TryFrom<&str>`; `Display` writes the name `as_str`
+    /// returns; and `NAMES` lists the names in `ALL` order.
+    #[test]
+    fn every_extension_name_reads_back_as_that_extension() {
+      for (index, extension) in Extension::ALL.into_iter().enumerate() {
+        let name = extension.as_str();
+        assert_eq!(Extension::NAMES[index], name);
+        assert_eq!(
+          name.parse::<Extension>(),
+          Ok(extension),
+          "{name} must read back through FromStr"
+        );
+        assert_eq!(
+          Extension::try_from(name),
+          Ok(extension),
+          "{name} must read back through TryFrom<&str>"
+        );
+        assert_eq!(format!("{extension}"), name);
+      }
+    }
+
+    /// LAW: any name but the eight is refused as `UnknownExtension`, which
+    /// carries the name as given, and whose message names it and lists the
+    /// eight. A name is read exactly as written, so another case,
+    /// surrounding whitespace or `-` for `_` is unknown; and `description`
+    /// and `tags`, which every task asks for, are not extensions.
+    #[test]
+    fn an_unknown_name_is_refused_by_name_listing_the_eight() {
+      for name in [
+        "",
+        "Scene",
+        "SCENE",
+        " scene",
+        "scene ",
+        "shot-type",
+        "shotType",
+        "ShotType",
+        "description",
+        "tags",
+        "mood",
+        "scene,subjects",
+      ] {
+        let err = name
+          .parse::<Extension>()
+          .expect_err("only the eight names are extensions");
+        assert_eq!(err.name(), name);
+        assert_eq!(Extension::try_from(name), Err(err.clone()));
+        assert_eq!(
+          format!("{err}"),
+          format!(
+            "unknown image-analysis extension {name:?}: expected one of scene, subjects, objects, actions, emotion, shot_type, lighting, categories"
+          )
+        );
+      }
+    }
+
+    /// LAW: with the `serde` feature an extension travels as its name. A
+    /// list of extensions is a JSON array of names and reads back as the
+    /// same list; a name `FromStr` refuses is an unknown variant, refused
+    /// with the eight names expected; and a value that is not a string is
+    /// refused.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_carries_an_extension_as_its_name() {
+      let all: Vec<Extension> = Extension::ALL.into();
+      let json = serde_json::to_string(&all).expect("a list of extensions serializes");
+      assert_eq!(
+        json,
+        r#"["scene","subjects","objects","actions","emotion","shot_type","lighting","categories"]"#
+      );
+      let read: Vec<Extension> =
+        serde_json::from_str(&json).expect("the array of names deserializes");
+      assert_eq!(read, all);
+      for extension in Extension::ALL {
+        let name = extension.as_str();
+        assert_eq!(
+          serde_json::to_value(extension).expect("an extension serializes"),
+          json!(name)
+        );
+        assert_eq!(
+          serde_json::from_value::<Extension>(json!(name)).expect("its name deserializes"),
+          extension
+        );
+      }
+
+      let err = serde_json::from_str::<Vec<Extension>>(r#"["scene","shot-type"]"#)
+        .expect_err("an unknown name is refused");
+      assert!(
+        format!("{err}").starts_with(
+          "unknown variant `shot-type`, expected one of `scene`, `subjects`, `objects`, `actions`, `emotion`, `shot_type`, `lighting`, `categories`"
+        ),
+        "got {err}"
+      );
+      for refused in [
+        r#""Scene""#,
+        r#""description""#,
+        r#""""#,
+        "0",
+        "true",
+        "null",
+        r#"["scene"]"#,
+        r#"{"scene":null}"#,
+      ] {
+        assert!(
+          serde_json::from_str::<Extension>(refused).is_err(),
+          "{refused} is not an extension name"
+        );
+      }
     }
 
     /// LAW: the default task's schema names exactly `description` and

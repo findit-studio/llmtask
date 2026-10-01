@@ -55,7 +55,7 @@ A `Task` written today against a JSON Schema runs through `lfm` (llguidance) and
 - **`UnsupportedGrammar` error** carrying the rejected variant `kind()` and the engine's `supported` list — callers can route to a different engine when one variant isn't accepted.
 - **Optional `json` feature** (default-on) — `Grammar::JsonSchema(serde_json::Value)` plus the `JsonParseError` convenience type. Drop it via `default-features = false, features = ["alloc"]` (or `"regex"` / `"serde"`, both of which imply `alloc`) to get a Lark-or-Regex-only build with no `serde_json` dep. NOTE: `alloc` is required to reach any public API — `default-features = false` alone exposes nothing.
 - **Optional `regex` feature** — pre-compiled `regex::Regex` in the variant (validation enforced by the type), plus `as_regex()` / `as_regex_pattern()` helpers.
-- **Optional `serde` feature** — `Serialize` / `Deserialize` on `ImageAnalysis` for downstream wire formats.
+- **Optional `serde` feature** — `Serialize` / `Deserialize` on `ImageAnalysis` for downstream wire formats, and (with `json`) on `image_analysis::Extension` by its name.
 - **Canonical `ImageAnalysis`** — ten-field single-image VLM output shape with builder-style API (`with_*` / `set_*`), shared across the findit-studio engines.
 - **Canonical `ImageAnalysisTask`** (behind `json`) — the prompt + schema + parser that produces an `ImageAnalysis`, so every engine runs the same task instead of a per-engine copy.
 
@@ -184,7 +184,7 @@ llmtask = { version = "0.3", features = ["json", "regex", "serde"] }
 | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `json`   | yes     | `Grammar::JsonSchema(serde_json::Value)` variant + `JsonParseError` + the `serde_json` dep (with its additive `raw_value` feature) |
 | `regex`  | no      | `Grammar::Regex(RegexGrammar)` variant + validating `Grammar::regex` constructor + `regex` dep                                     |
-| `serde`  | no      | `Serialize` / `Deserialize` on `ImageAnalysis`                                                                                     |
+| `serde`  | no      | `Serialize` / `Deserialize` on `ImageAnalysis`, and (with `json`) on `image_analysis::Extension` by its name                       |
 
 ## MSRV
 

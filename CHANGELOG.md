@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-01
+
 ### Added
 - `image_analysis::Extension` spells its name, the field's JSON key, on
   every road, so a document can list the extensions a deployment switches

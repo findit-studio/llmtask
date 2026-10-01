@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Changed
 - **Breaking:** `ImageAnalysisTask` is built from a field roster, and its
   schema, prompt and parser are all derived from it. `ImageAnalysisTask::new()`

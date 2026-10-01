@@ -46,6 +46,35 @@ pub enum Grammar {
   /// JSON Schema (RFC 8927-style draft, as accepted by serde_json
   /// `Value`). The widest-compatible variant; all current engines
   /// accept it. Gated on the `json` feature.
+  ///
+  /// An engine that serves this crate's own JSON task,
+  /// [`ImageAnalysisTask`](crate::image_analysis::ImageAnalysisTask),
+  /// must honour every keyword its schema uses: `type`, `properties`,
+  /// `required`, `additionalProperties: false`, `items`, `maxLength`
+  /// (a string's length in Unicode scalar values) and `maxItems` (an
+  /// array's element count). The task's `parse` holds the answer to the
+  /// same keywords and to nothing looser, so it returns `Ok` only for an
+  /// answer the schema accepts: a JSON text, with nothing but JSON
+  /// whitespace around its value, in which every field has exactly the
+  /// JSON type the schema declares for it. A string where the schema
+  /// declares an array of strings (a comma-separated list included) and an
+  /// array where it declares a string (a one-element array included) are
+  /// refused like any other violation, by name, as
+  /// [`JsonParseError::MissingFields`](crate::JsonParseError::MissingFields);
+  /// an undeclared key is
+  /// [`JsonParseError::UnknownFields`](crate::JsonParseError::UnknownFields).
+  /// A decoder that enforces this schema never produces such a shape, so
+  /// `parse` tolerates none, and an engine that ignores a keyword surfaces
+  /// as a parse error rather than as silently over-long or reshaped output.
+  ///
+  /// Only an answer that is not a JSON text is
+  /// [`JsonParseError::Json`](crate::JsonParseError::Json): text serde_json's
+  /// grammar rejects, or a string that escapes one half of a UTF-16
+  /// surrogate pair (`\uD800` alone), which no Unicode text can hold,
+  /// wherever that string sits. Every other answer reaches the checks above
+  /// whole, however large or small its numbers and however deep its
+  /// nesting: `1e400` where a string is declared is `MissingFields` naming
+  /// the field, and under an undeclared key it is `UnknownFields`.
   #[cfg(feature = "json")]
   #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
   JsonSchema(serde_json::Value),

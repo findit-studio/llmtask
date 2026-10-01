@@ -42,7 +42,9 @@ regex   = ["dep:regex", "dep:regex-syntax", "alloc"]
 
 [dependencies]
 serde      = { version = "1", default-features = false, features = ["derive"], optional = true }
-serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
+# `raw_value` lets `ImageAnalysisTask::parse` check each field's JSON type
+# before it decodes the value; it only adds the `RawValue` type.
+serde_json = { version = "1", default-features = false, features = ["alloc", "raw_value"], optional = true }
 smol_str   = { version = "0.3", default-features = false, optional = true }
 thiserror  = { version = "2", default-features = false }
 regex      = { version = "1", default-features = false, optional = true }

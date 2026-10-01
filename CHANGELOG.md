@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `ImageAnalysisTask` is built from a field roster, and its
+  schema, prompt and parser are all derived from it. `ImageAnalysisTask::new()`
+  now asks for `description` (one sentence of at most
+  `ImageAnalysisTask::DEFAULT_DESCRIPTION_MAX_CHARS` = 120 characters) and
+  `tags` (at most `ImageAnalysisTask::DEFAULT_TAGS_MAX_ITEMS` = 8 labels)
+  only. Each of the other eight fields (`scene`, `subjects`, `objects`,
+  `actions`, `emotion`, `shot_type`, `lighting`, `categories`) is an
+  `Extension` switched on with `with_extensions`; a switched-off field is
+  absent from the schema and the prompt, is refused as
+  `JsonParseError::UnknownFields` if an answer carries it, and reads empty
+  in the parsed `ImageAnalysis`. `with_extensions(Extension::ALL)` asks for
+  all ten fields, as the task did before. `ImageAnalysis` keeps its ten
+  fields.
+- Both caps are stated in the JSON Schema (`maxLength` on `description`,
+  `maxItems` on `tags`) and in the prompt, and `parse` refuses an answer over
+  either cap as `JsonParseError::MissingFields` naming the field instead of
+  truncating it. The `Grammar::JsonSchema` docs now list the keywords an
+  engine serving `ImageAnalysisTask` must honour.
+- **Breaking:** `ImageAnalysisTask::parse` accepts each field only in the
+  JSON type its schema entry declares, so `Ok` means the answer satisfied the
+  schema. The drift tolerances are gone: a comma-separated string for `tags`,
+  a bare string for an array field (`subjects`, `objects`, `actions`,
+  `emotion`, `lighting`, `categories`) and a one-element array for
+  `shot_type` are each refused as `JsonParseError::MissingFields` naming the
+  field, like any other value of an undeclared type. The answer must also be
+  a JSON text: `parse` no longer trims whitespace JSON does not allow (a
+  no-break space, a line separator) from around the object, and refuses it
+  as `JsonParseError::Json`; JSON whitespace there still parses. A decoder
+  that enforces the schema (the `Grammar::JsonSchema` contract) never
+  produces any of those shapes. Leniency for an engine that does not
+  enforce the grammar, if it is ever wanted, is a separate, explicit
+  opt-in; none is built.
+- `ImageAnalysisTask::parse` names the field whatever JSON value it holds.
+  A number outside `f64`'s range (`1e400`) or a value nested deeper than
+  serde_json's recursion limit of 128 used to fail the whole answer as
+  `JsonParseError::Json` before its field could be named. In a field the
+  task asks for, such a value is now `JsonParseError::MissingFields`
+  naming that field; under any other key it is
+  `JsonParseError::UnknownFields`; and a top-level value that is not an
+  object names every asked-for field whatever it holds.
+  `JsonParseError::Json` now means exactly that the answer is not a JSON
+  text, and it comes first: an answer that is not JSON is `Json` even when
+  it also repeats a key. A string escaping one half of a UTF-16 surrogate
+  pair, which no Unicode text can hold, is `Json` wherever it sits. The
+  `json` feature turns on serde_json's additive `raw_value` feature, which
+  `parse` uses to check each field's JSON type before decoding its value.
+
+### Added
+- `image_analysis::Extension`, the closed set of the eight optional fields,
+  with `ALL` and `as_str` (the field's JSON key).
+- `ImageAnalysisTask::{has_extension, with_extensions, set_extensions}` and
+  the cap accessors `description_max_chars` / `tags_max_items` with their
+  `with_*` / `set_*` builders.
+
 ## [0.3.0] - 2026-08-31
 
 ### Added

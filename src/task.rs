@@ -142,7 +142,10 @@ mod json {
   /// variant.
   #[derive(thiserror::Error, Debug)]
   pub enum JsonParseError {
-    /// `serde_json` failed to parse the response as valid JSON.
+    /// The response is not a JSON text: `serde_json` failed to parse it.
+    /// `image_analysis::ImageAnalysisTask` also refuses here a string that
+    /// escapes one half of a UTF-16 surrogate pair, which serde_json's
+    /// grammar admits but no Unicode text can hold, wherever it sits.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     /// The top-level JSON object declared the same member name more than
@@ -154,20 +157,29 @@ mod json {
     /// depending only on which copy comes last in the text), and a
     /// duplicate of a name [`Self::UnknownFields`] would otherwise catch
     /// can no longer be seen once collapsed to one entry. Tasks that
-    /// decode their top-level object through a duplicate-checking parse
+    /// read their top-level object through a duplicate-checking parse
     /// (e.g. `image_analysis::ImageAnalysisTask::parse`) return this
-    /// instead, naming the repeated key, before a `Value` is ever built.
+    /// instead, naming the repeated key, before any member's value is
+    /// checked.
     #[error("schema violation: top-level key appears more than once: {0:?}")]
     DuplicateField(SmolStr),
     /// JSON parsed but one or more schema fields are unusable: a required
-    /// field absent or present as JSON `null`, or any listed field (required
-    /// or optional) present with a JSON type its schema entry can't satisfy
-    /// (e.g. a number where a string or array of strings is expected). All
-    /// three cases are folded into one variant because the schema requires
-    /// every listed field to carry a string or array-of-strings value —
-    /// never null, and never a type the field's shape can't hold — so a
-    /// decoder that violates any of them has drifted the same way from the
-    /// caller's perspective: the field's value can't be used.
+    /// field absent or present as JSON `null`, any listed field (required
+    /// or optional) present with any JSON type other than the one its
+    /// schema entry declares, or a value over a cap its schema entry
+    /// declares (`maxLength`, `maxItems`). Another type means any of them:
+    /// a number, a boolean or an object; a string where an array of strings
+    /// is declared (a comma-separated list included); an array where a
+    /// string is declared (a one-element array included); or an array
+    /// holding anything but strings, whatever a number's magnitude or a
+    /// nested value's depth. All four cases are folded into one
+    /// variant because the schema requires every listed field to carry a
+    /// value of its declared type within its caps — never null, never
+    /// another type, never longer than declared — so a decoder that
+    /// violates any of them has drifted the same way from the caller's
+    /// perspective: the field's value can't be used. A task names such a
+    /// field here; it never coerces the value into the declared shape and
+    /// never truncates it to fit.
     #[error("schema violation: required fields missing, null, or invalid: {0:?}")]
     MissingFields(Vec<&'static str>),
     /// JSON parsed as an object, but it carries one or more keys outside

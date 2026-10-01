@@ -66,6 +66,15 @@ pub enum Grammar {
   /// A decoder that enforces this schema never produces such a shape, so
   /// `parse` tolerates none, and an engine that ignores a keyword surfaces
   /// as a parse error rather than as silently over-long or reshaped output.
+  ///
+  /// Only an answer that is not a JSON text is
+  /// [`JsonParseError::Json`](crate::JsonParseError::Json): text serde_json's
+  /// grammar rejects, or a string that escapes one half of a UTF-16
+  /// surrogate pair (`\uD800` alone), which no Unicode text can hold,
+  /// wherever that string sits. Every other answer reaches the checks above
+  /// whole, however large or small its numbers and however deep its
+  /// nesting: `1e400` where a string is declared is `MissingFields` naming
+  /// the field, and under an undeclared key it is `UnknownFields`.
   #[cfg(feature = "json")]
   #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
   JsonSchema(serde_json::Value),

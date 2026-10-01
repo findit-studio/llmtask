@@ -363,14 +363,13 @@ mod image_analysis_task {
     num::NonZeroUsize,
   };
 
-  use serde::de::{self, Deserializer as _, MapAccess, SeqAccess, Visitor};
-  use serde_json::{Map, Value, json};
+  use serde::de::{self, Deserializer as _, MapAccess, Visitor};
+  use serde_json::{Map, Value, json, value::RawValue};
   use smol_str::SmolStr;
-  // Bring `String` into scope under both std (resolves via the
-  // `extern crate std`) and alloc-only (resolves via the
-  // `extern crate alloc as std` alias in lib.rs) — needed by the prompt
-  // builder and `TopLevelVisitor::visit_string`.
-  use std::{string::String, vec::Vec};
+  // Heap types under both std (resolves via the `extern crate std`) and
+  // alloc-only (resolves via the `extern crate alloc as std` alias in
+  // lib.rs).
+  use std::{collections::BTreeMap, string::String, vec::Vec};
 
   use super::ImageAnalysis;
   use crate::{
@@ -461,9 +460,9 @@ Rules:
   }
 
   /// A field's JSON type. [`ImageAnalysisTask::build_schema`] declares it
-  /// and [`field_is_well_shaped`] accepts it and nothing else, both reading
-  /// it from [`Field::shape`], so `parse` cannot accept a shape the schema
-  /// does not declare.
+  /// and [`decode_field`] reads it and nothing else, both taking it from
+  /// [`Field::shape`], so `parse` cannot accept a shape the schema does not
+  /// declare.
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   enum Shape {
     /// `{"type": "string"}`.
@@ -611,6 +610,15 @@ Rules:
   /// assert!(matches!(
   ///   ImageAnalysisTask::new().parse(raw),
   ///   Err(JsonParseError::MissingFields(fields)) if fields == ["tags"]
+  /// ));
+  ///
+  /// // Only an answer that is not JSON is `JsonParseError::Json`. A number
+  /// // too large for an `f64` is still JSON, so in a string field it is
+  /// // refused by the field's name.
+  /// let raw = r#"{"description": 1e400, "tags": ["office"]}"#;
+  /// assert!(matches!(
+  ///   ImageAnalysisTask::new().parse(raw),
+  ///   Err(JsonParseError::MissingFields(fields)) if fields == ["description"]
   /// ));
   /// ```
   #[derive(Clone)]
@@ -821,11 +829,10 @@ Rules:
     /// `additionalProperties: false` declares that any field outside this
     /// list is invalid — a switched-off extension's field included — a
     /// constraint a constrained-decoding engine can enforce at generation
-    /// time, but `parse` cannot inherit for free: a `serde_json::Map`
-    /// decode of already-generated text accepts any key regardless of what
-    /// the schema says, so `parse` enforces this promise itself via
-    /// `unknown_fields`, and each field's type and cap via
-    /// `unusable_fields`.
+    /// time, but `parse` cannot inherit for free: reading already-generated
+    /// text accepts any key regardless of what the schema says, so `parse`
+    /// enforces this promise itself via `unknown_fields`, and each field's
+    /// type and cap via `usable_value`.
     fn build_schema(&self) -> Value {
       let properties: Map<String, Value> = self
         .fields()
@@ -935,7 +942,7 @@ Rules:
       }
     }
 
-    /// Names the keys in `object` that the task's schema does not declare
+    /// Names the keys of `members` that the task's schema does not declare
     /// — any key outside the fields the task asks for, a switched-off
     /// extension's field included. The runtime enforcement of the schema's
     /// `additionalProperties: false` (see [`Self::build_schema`]).
@@ -943,19 +950,20 @@ Rules:
     /// Owned [`SmolStr`] rather than `&'static str`: unlike a declared
     /// field name, an unknown key isn't known at compile time — it's
     /// whatever text the decoder emitted.
-    fn unknown_fields(&self, object: &Map<String, Value>) -> Vec<SmolStr> {
-      object
+    fn unknown_fields(&self, members: &BTreeMap<String, &RawValue>) -> Vec<SmolStr> {
+      members
         .keys()
         .filter(|key| !self.fields().any(|field| field.key() == key.as_str()))
         .map(SmolStr::new)
         .collect()
     }
 
-    /// Names the fields the task asks for that `object` leaves unusable:
-    /// absent or JSON `null`, present with any JSON type other than the
-    /// one the schema declares for the field (see [`field_is_well_shaped`]),
-    /// or over a cap the schema declares (see [`Self::exceeds_cap`]). Keys
-    /// outside the roster are a separate concern, handled by
+    /// `field`'s value in the answer, `value`, decoded as the task can use
+    /// it: present, of exactly the JSON type the schema declares for the
+    /// field (see [`decode_field`]), and within any cap the schema declares
+    /// (see [`Self::exceeds_cap`]). `Ok(None)` leaves the field unusable:
+    /// absent, `null`, of any other JSON type, or over a cap. Keys outside
+    /// the roster are a separate concern, handled by
     /// [`Self::unknown_fields`].
     ///
     /// Folding "wrong type" into the same named-field list as
@@ -967,30 +975,28 @@ Rules:
     /// over a cap is folded in for the same reason: the schema promises
     /// the cap, so such a value has drifted from the schema as a wrong-typed
     /// one has, and `parse` refuses it by name rather than truncating the
-    /// model's words to fit. Every unusable field is caught in this one
-    /// pass and named.
-    fn unusable_fields(&self, object: &Map<String, Value>) -> Vec<&'static str> {
-      self
-        .fields()
-        .filter(|&field| match object.get(field.key()) {
-          None | Some(Value::Null) => true,
-          Some(value) => !field_is_well_shaped(field, value) || self.exceeds_cap(field, value),
-        })
-        .map(Field::key)
-        .collect()
+    /// model's words to fit. `parse` names every unusable field at once.
+    fn usable_value(
+      &self,
+      field: Field,
+      value: Option<&RawValue>,
+    ) -> Result<Option<FieldValue>, serde_json::Error> {
+      let Some(value) = value else {
+        return Ok(None);
+      };
+      Ok(decode_field(field, value)?.filter(|value| !self.exceeds_cap(field, value)))
     }
 
     /// `true` iff `value` holds more than the cap `field`'s schema entry
     /// declares, counted the way the schema counts: `description` in
     /// Unicode scalar values of the string as the answer wrote it (before
-    /// `parse` trims it), `tags` in elements of the array. Called only on a
-    /// value [`field_is_well_shaped`] accepted.
-    fn exceeds_cap(&self, field: Field, value: &Value) -> bool {
+    /// `parse` trims it), `tags` in elements of the array.
+    fn exceeds_cap(&self, field: Field, value: &FieldValue) -> bool {
       match (field, value) {
-        (Field::Description, Value::String(description)) => {
+        (Field::Description, FieldValue::String(description)) => {
           description.chars().count() > self.description_max_chars.get()
         }
-        (Field::Tags, Value::Array(items)) => items.len() > self.tags_max_items.get(),
+        (Field::Tags, FieldValue::Strings(tags)) => tags.len() > self.tags_max_items.get(),
         _ => false,
       }
     }
@@ -1022,14 +1028,15 @@ Rules:
     }
 
     fn parse(&self, raw: &str) -> Result<Self::Output, JsonParseError> {
-      // Not a plain `serde_json::from_str` (see `parse_top_level_value`'s
-      // doc comment): that collapses a duplicate top-level member — later
-      // overwrites earlier — before any check below ever sees both copies.
-      // `raw` goes in untrimmed: the deserializer skips the JSON whitespace
-      // a JSON text may carry around its value, and any other character
-      // there is not JSON.
-      let value: Value = parse_top_level_value(raw)?;
-      let Some(object) = value.as_object() else {
+      // Not a plain `serde_json::from_str` into a `Value` (see
+      // `parse_members`'s doc comment): that collapses a duplicate
+      // top-level member — later overwrites earlier — before any check
+      // below ever sees both copies, and it fails on valid JSON (a number
+      // outside `f64`'s range, deep nesting) before the field holding it
+      // can be named. `raw` goes in untrimmed: the deserializer skips the
+      // JSON whitespace a JSON text may carry around its value, and any
+      // other character there is not JSON.
+      let Some(members) = parse_members(raw)? else {
         // Not a JSON object at all: by definition every field the task
         // asks for is absent. Naming them via `MissingFields` is more
         // informative than a generic "expected top-level object" error,
@@ -1040,39 +1047,43 @@ Rules:
       };
       // Runtime enforcement of `additionalProperties: false` (see
       // `build_schema`): the schema declaring it constrains a
-      // constrained-decoding engine, but nothing about decoding the
-      // already-generated text through `serde_json::Map` — which accepts
-      // any key — enforces it. Checked before `unusable_fields` so an
-      // object with both an unknown key and a missing/invalid declared
-      // field is named for the unknown key first (a structural violation
-      // of "which keys are even allowed" takes precedence over per-field
-      // shape checks).
-      let unknown = self.unknown_fields(object);
+      // constrained-decoding engine, but nothing about reading the
+      // already-generated text — which accepts any key — enforces it.
+      // Checked before the declared fields so an object with both an
+      // unknown key and a missing/invalid declared field is named for the
+      // unknown key first (a structural violation of "which keys are even
+      // allowed" takes precedence over per-field shape checks).
+      let unknown = self.unknown_fields(&members);
       if !unknown.is_empty() {
         return Err(JsonParseError::UnknownFields(unknown));
       }
-      let unusable = self.unusable_fields(object);
+      let mut values = Vec::new();
+      let mut unusable = Vec::new();
+      for field in self.fields() {
+        match self.usable_value(field, members.get(field.key()).copied())? {
+          Some(value) => values.push((field, value)),
+          None => unusable.push(field.key()),
+        }
+      }
       if !unusable.is_empty() {
         return Err(JsonParseError::MissingFields(unusable));
       }
-      // Every field `unusable_fields` didn't flag is now known to carry
-      // exactly the shape its schema entry declares, so extraction itself
-      // is infallible from here. A field the task does not ask for is
-      // never read and keeps its empty default.
+      // Every field now holds exactly the shape its schema entry declares,
+      // so the extraction cannot fail. A field the task does not ask for
+      // is never read and keeps its empty default.
       let mut result = ImageAnalysis::new();
-      for field in self.fields() {
-        let key = field.key();
+      for (field, value) in values {
         match field {
-          Field::Scene => result.set_scene(extract_label(object, key)),
-          Field::Description => result.set_description(extract_label(object, key)),
-          Field::Subjects => result.set_subjects(extract_labels(object, key)),
-          Field::Objects => result.set_objects(extract_labels(object, key)),
-          Field::Actions => result.set_actions(extract_labels(object, key)),
-          Field::Emotion => result.set_emotion(extract_labels(object, key)),
-          Field::ShotType => result.set_shot_type(extract_label(object, key)),
-          Field::Lighting => result.set_lighting(extract_labels(object, key)),
-          Field::Tags => result.set_tags(extract_labels(object, key)),
-          Field::Categories => result.set_categories(extract_labels(object, key)),
+          Field::Scene => result.set_scene(value.into_label()),
+          Field::Description => result.set_description(value.into_label()),
+          Field::Subjects => result.set_subjects(value.into_labels()),
+          Field::Objects => result.set_objects(value.into_labels()),
+          Field::Actions => result.set_actions(value.into_labels()),
+          Field::Emotion => result.set_emotion(value.into_labels()),
+          Field::ShotType => result.set_shot_type(value.into_label()),
+          Field::Lighting => result.set_lighting(value.into_labels()),
+          Field::Tags => result.set_tags(value.into_labels()),
+          Field::Categories => result.set_categories(value.into_labels()),
         };
       }
       // Indexable-content gate. The prompt's rules instruct the model to
@@ -1089,201 +1100,275 @@ Rules:
     }
   }
 
-  // ===== duplicate-checked top-level parse (Codex R2, PR #5) =====
+  // ===== reading the answer =====
 
-  /// Deserializes `raw` into a [`Value`], refusing a TOP-level object
-  /// member name that appears more than once, instead of silently
-  /// collapsing it the way `serde_json::from_str::<Value>` (what this
-  /// replaced) does.
+  /// Reads `raw` as one JSON text and returns the members of its top-level
+  /// object, each key decoded and each value kept as the JSON text the
+  /// answer wrote it in ([`RawValue`]), or `None` when the top-level value
+  /// is not an object.
   ///
-  /// `from_str::<Value>` builds the object via repeated `Map::insert`, so
-  /// a later member overwrites an earlier one with no trace left behind:
-  /// `{"categories": null, "categories": []}` and `{"categories": []}`
-  /// deserialize to the identical `Value`, while the reverse key order
-  /// (`{"categories": [], "categories": null}`) deserializes to the same
-  /// `Value` as `{"categories": null}` alone. Both orderings are schema
-  /// violations no compliant decoder should emit, but only one of the two
-  /// used to be caught — by `unusable_fields`, and only because `null`
-  /// happened to survive the collapse — while the reverse order silently
-  /// passed; a duplicated key **outside** the declared fields could never
-  /// be named by `unknown_fields` at all, because by the time it runs the
-  /// `Map` remembers only the surviving copy. Checking here, before any
-  /// `Value` is built, is the only point where both copies are still
-  /// visible to compare.
+  /// No value is decoded here. The field checks decode a declared field's
+  /// value only once its first byte shows the JSON type the schema
+  /// declares (see [`decode_field`]). Decoding every value into a
+  /// [`Value`] up front, as `serde_json::from_str` does, fails on valid
+  /// JSON before the field holding it can be named: a number outside
+  /// `f64`'s range (`1e400`) is `NumberOutOfRange`, and nesting deeper than
+  /// serde_json's limit of 128 is `RecursionLimitExceeded`.
   ///
-  /// Scope is TOP-level only, deliberately: every property a task's schema
-  /// can declare is `string` or `array of string` — this contract has
-  /// no `object`-valued field, at the top level or nested. A JSON object
-  /// can therefore only legitimately appear here as the document root;
-  /// anywhere else (e.g. an object smuggled into a `subjects` array
-  /// element in place of a string) it's already a wrong-shaped value that
-  /// [`field_is_well_shaped`] rejects on type alone, regardless of what
-  /// its own internal keys collapsed to. A future field that legitimately
-  /// nests an object would need this same duplicate check extended to it.
+  /// `raw` is read in two passes:
   ///
-  /// This is also the crate's only JSON entry point: [`ImageAnalysisTask::parse`]
-  /// calls nothing else that builds a `Value` from text — no fenced-code
-  /// stripping, no secondary lenient parse. `reject_fenced_json` and
+  /// 1. serde_json checks that `raw` is a JSON text, one value with nothing
+  ///    but JSON whitespace around it, and captures that value as a
+  ///    [`RawValue`]. The capture checks the grammar without converting
+  ///    anything: a number is read digit by digit and never becomes an
+  ///    `f64`, so its magnitude cannot fail it, and nested arrays and
+  ///    objects are walked with a stack on the heap rather than by
+  ///    recursion, so their depth cannot fail it either. A string's escapes
+  ///    are checked for form but not decoded, which lets through the one
+  ///    escape the grammar admits and no Unicode text can hold: half a
+  ///    UTF-16 surrogate pair (`\uD800` alone). Decoding such a string
+  ///    fails, so [`find_lone_surrogate`] refuses the answer as not JSON
+  ///    wherever the escape sits — in a key, a field, an undeclared member
+  ///    or a nested value — not only where a string gets decoded.
+  /// 2. For an object, [`MembersVisitor`] reads the members, decoding each
+  ///    key and capturing each value, and refuses a member name that
+  ///    appears twice.
+  ///
+  /// So [`JsonParseError::Json`] means exactly that `raw` is not a JSON
+  /// text, and it comes before every other refusal, a duplicate key
+  /// included.
+  ///
+  /// The members are read by [`MembersVisitor`] rather than a stock map
+  /// decode because a stock decode builds the object by repeated
+  /// insertion: a later member overwrites an earlier one with no trace left
+  /// behind. `{"categories": null, "categories": []}` would read as
+  /// `{"categories": []}`, and the reverse key order as
+  /// `{"categories": null}` alone. Both orderings are schema violations no
+  /// compliant decoder should emit, but only the second would be caught —
+  /// by the field check, and only because `null` happened to survive the
+  /// collapse — and a duplicated key **outside** the declared fields could
+  /// never be named by `unknown_fields` at all, because by then only one
+  /// copy is left. While the members are read is the only point where
+  /// both copies are still visible to compare.
+  ///
+  /// The duplicate check covers the top level only, deliberately: every
+  /// property a task's schema can declare is `string` or `array of string`
+  /// — this contract has no `object`-valued field, at the top level or
+  /// nested. A JSON object can therefore only legitimately appear as the
+  /// document root; anywhere else (e.g. an object in place of a string in
+  /// a `subjects` array) it is already a wrong-shaped value that
+  /// [`decode_field`] refuses on its first byte, whatever its own keys. A
+  /// future field that legitimately nests an object would need this same
+  /// duplicate check extended to it.
+  ///
+  /// This is the only place `parse` reads `raw` itself: the field checks
+  /// decode only text captured here, and nothing strips a fence or retries
+  /// a lenient parse. `reject_fenced_json` and
   /// `reject_json_with_wrapper_text` (in the tests below) pass because
-  /// `raw` isn't valid/complete JSON on its own, not via a
-  /// different code path, so routing through here covers the whole parse
-  /// surface — there is no second `from_str`/`from_value` call anywhere in
-  /// this crate for a fenced or prose-wrapped variant to bypass.
-  fn parse_top_level_value(raw: &str) -> Result<Value, JsonParseError> {
-    let mut deserializer = serde_json::Deserializer::from_str(raw);
+  /// `raw` isn't valid/complete JSON on its own, not via a different code
+  /// path.
+  fn parse_members(raw: &str) -> Result<Option<BTreeMap<String, &RawValue>>, JsonParseError> {
+    let value: &RawValue = serde_json::from_str(raw)?;
+    if let Some(escape) = find_lone_surrogate(raw) {
+      return Err(JsonParseError::Json(lone_surrogate_error(raw, escape)));
+    }
+    if !value.get().starts_with('{') {
+      return Ok(None);
+    }
     let duplicate: RefCell<Option<SmolStr>> = RefCell::new(None);
-    let visited = deserializer.deserialize_any(TopLevelVisitor {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    match deserializer.deserialize_map(MembersVisitor {
       duplicate: &duplicate,
-    });
-    match visited {
-      Ok(value) => {
-        // Mirrors `serde_json::from_str`'s own trailing-content check:
-        // rejects prose after the JSON object, an unclosed fence, etc.
-        // (`reject_fenced_json`, `reject_json_with_wrapper_text`).
-        deserializer.end()?;
-        Ok(value)
-      }
-      Err(err) => match duplicate.into_inner() {
-        Some(key) => Err(JsonParseError::DuplicateField(key)),
-        None => Err(JsonParseError::Json(err)),
-      },
+    }) {
+      Ok(members) => Ok(Some(members)),
+      Err(err) => Err(match duplicate.into_inner() {
+        Some(key) => JsonParseError::DuplicateField(key),
+        None => JsonParseError::Json(err),
+      }),
     }
   }
 
-  /// [`Visitor`] behind [`parse_top_level_value`]. Mirrors
-  /// `serde_json::Value`'s own `Deserialize` impl method-for-method —
-  /// every shape produces the identical `Value` — except [`Self::visit_map`],
-  /// which refuses a repeated key instead of overwriting the earlier entry.
+  /// [`Visitor`] behind [`parse_members`]'s second pass: the top-level
+  /// object's members, each key decoded and each value captured as a
+  /// [`RawValue`], with a member name seen earlier in the object refused.
   ///
-  /// `visit_i128` / `visit_u128` / `visit_none` / `visit_some` are not
-  /// overridden: this crate doesn't enable serde_json's
-  /// `arbitrary_precision` feature, and without it `deserialize_any` only
-  /// ever calls `visit_f64` / `visit_u64` / `visit_i64` for a JSON number
-  /// and `visit_unit` for `null` (verified against `serde_json`'s own
-  /// `ParserNumber` and null-literal dispatch). Those four methods are
-  /// unreachable through `serde_json::Deserializer`, so overriding them
-  /// here would be untested dead code; the `Visitor` trait's default
-  /// implementations (which forward sensibly on their own) still apply if
-  /// that ever changes.
-  struct TopLevelVisitor<'a> {
+  /// `MapAccess`'s error type is fixed to `serde_json::Error` by the
+  /// driving `Deserializer`, which has no variant that names an arbitrary
+  /// field, so the key travels out through `self.duplicate` instead —
+  /// [`parse_members`] reads it back after the `Err` this returns
+  /// propagates up through `deserialize_map`.
+  struct MembersVisitor<'a> {
     duplicate: &'a RefCell<Option<SmolStr>>,
   }
 
-  impl<'de> Visitor<'de> for TopLevelVisitor<'_> {
-    type Value = Value;
+  impl<'de> Visitor<'de> for MembersVisitor<'_> {
+    type Value = BTreeMap<String, &'de RawValue>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-      f.write_str("a JSON value")
+      f.write_str("a JSON object")
     }
 
-    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-      Ok(Value::Bool(v))
-    }
-
-    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-      Ok(Value::from(v))
-    }
-
-    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-      Ok(Value::from(v))
-    }
-
-    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
-      Ok(Value::from(v))
-    }
-
-    fn visit_str<E>(self, v: &str) -> Result<Value, E>
-    where
-      E: de::Error,
-    {
-      self.visit_string(String::from(v))
-    }
-
-    fn visit_string<E>(self, v: String) -> Result<Value, E> {
-      Ok(Value::String(v))
-    }
-
-    fn visit_unit<E>(self) -> Result<Value, E> {
-      Ok(Value::Null)
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Value, A::Error>
-    where
-      A: SeqAccess<'de>,
-    {
-      let mut vec = Vec::new();
-      while let Some(elem) = seq.next_element()? {
-        vec.push(elem);
-      }
-      Ok(Value::Array(vec))
-    }
-
-    /// The one method that differs from stock `Value` decoding: a member
-    /// name seen earlier in this same object is refused. `MapAccess`'s
-    /// error type is fixed to `serde_json::Error` by the driving
-    /// `Deserializer`, which has no variant that names an arbitrary
-    /// field, so the key travels out through `self.duplicate` instead —
-    /// [`parse_top_level_value`] reads it back after the `Err` this
-    /// returns propagates up through `deserialize_any`.
-    fn visit_map<A>(self, mut map: A) -> Result<Value, A::Error>
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
       A: MapAccess<'de>,
     {
-      let mut object = Map::new();
+      let mut members = BTreeMap::new();
       while let Some(key) = map.next_key::<String>()? {
-        if object.contains_key(&key) {
+        if members.contains_key(&key) {
           *self.duplicate.borrow_mut() = Some(SmolStr::new(&key));
           return Err(de::Error::custom("duplicate top-level key"));
         }
-        let value: Value = map.next_value()?;
-        object.insert(key, value);
+        let value: &'de RawValue = map.next_value()?;
+        members.insert(key, value);
       }
-      Ok(Value::Object(object))
+      Ok(members)
     }
   }
 
-  /// `true` iff `value` has exactly the JSON type `field`'s schema entry
-  /// declares ([`Field::shape`]): a string, or an array whose every
-  /// element is a string. No other shape passes: not a string for an array
-  /// field, not an array for a string field, however short. Presence and
-  /// `null` are checked by the caller (`unusable_fields` treats an absent
-  /// or `Value::Null` field as unusable without consulting this function).
-  fn field_is_well_shaped(field: Field, value: &Value) -> bool {
-    match field.shape() {
-      Shape::String => value.is_string(),
-      Shape::StringArray => value
-        .as_array()
-        .is_some_and(|items| items.iter().all(Value::is_string)),
+  /// The byte offset in `json` of the first `\u` escape that encodes one
+  /// half of a UTF-16 surrogate pair without the other half, if any.
+  ///
+  /// `json` must be a text serde_json has accepted as JSON grammar. That
+  /// grammar admits no backslash outside a string, and inside one every
+  /// backslash opens an escape: two bytes (`\"`, `\\`, `\/`, `\b`, `\f`,
+  /// `\n`, `\r`, `\t`) or `\u` and four hex digits. Stepping from escape to
+  /// escape therefore meets every `\u` escape in every key and string at
+  /// any depth, and parses nothing else. The rule is the one serde_json
+  /// applies when it decodes a string into Rust text: a leading half
+  /// (`\uD800` to `\uDBFF`) must be followed at once by a trailing half
+  /// (`\uDC00` to `\uDFFF`), and a trailing half may appear nowhere else.
+  fn find_lone_surrogate(json: &str) -> Option<usize> {
+    let bytes = json.as_bytes();
+    let mut index = 0;
+    while let Some(found) = bytes.get(index..)?.iter().position(|&byte| byte == b'\\') {
+      let escape = index + found;
+      let Some(unit) = utf16_escape(bytes, escape) else {
+        // A two-byte escape. Stepping over both bytes keeps the second
+        // backslash of `\\` from passing as the start of an escape.
+        index = escape + 2;
+        continue;
+      };
+      index = escape + 6;
+      match unit {
+        0xD800..=0xDBFF => match utf16_escape(bytes, index) {
+          Some(0xDC00..=0xDFFF) => index += 6,
+          _ => return Some(escape),
+        },
+        0xDC00..=0xDFFF => return Some(escape),
+        _ => {}
+      }
     }
+    None
   }
 
-  /// Extracts a string field (`scene`, `description`, `shot_type`): the
-  /// string, trimmed. `parse` calls it only once `unusable_fields` has
-  /// confirmed the value is a JSON string, so the empty fallback is never
-  /// reached.
-  fn extract_label(object: &Map<String, Value>, field: &str) -> SmolStr {
-    match object.get(field) {
-      Some(Value::String(s)) => SmolStr::new(s.trim()),
-      _ => SmolStr::default(),
+  /// The UTF-16 code unit of the `\uXXXX` escape at byte `at` of `bytes`,
+  /// or `None` when no `\u` escape starts there.
+  fn utf16_escape(bytes: &[u8], at: usize) -> Option<u16> {
+    let digits = bytes.get(at..at.checked_add(6)?)?.strip_prefix(b"\\u")?;
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+      return None;
     }
+    u16::from_str_radix(core::str::from_utf8(digits).ok()?, 16).ok()
   }
 
-  /// Extracts an array field (`subjects`, `objects`, `actions`, `emotion`,
-  /// `lighting`, `tags`, `categories`): each element through
-  /// [`push_label`], whole, because a label can itself contain a comma
-  /// (e.g. "red, white, and blue flag", "july 4, 2026"). `parse` calls it
-  /// only once `unusable_fields` has confirmed the value is an array of
-  /// strings, so no element is ever skipped for its type.
-  fn extract_labels(object: &Map<String, Value>, field: &str) -> Vec<SmolStr> {
-    let mut values = Vec::new();
-    if let Some(Value::Array(items)) = object.get(field) {
-      for item in items {
-        if let Value::String(s) = item {
-          push_label(&mut values, s);
+  /// The [`JsonParseError::Json`] error for the half surrogate pair whose
+  /// escape starts at byte `escape` of `json`: serde_json's grammar admits
+  /// the escape, but no Unicode text can hold it, so decoding the string
+  /// it sits in fails. The error carries the escape's line and column,
+  /// both counted from 1 as serde_json counts them.
+  fn lone_surrogate_error(json: &str, escape: usize) -> serde_json::Error {
+    let before = json.get(..escape).unwrap_or_default();
+    let line = before.matches('\n').count() + 1;
+    let column = before.len() - before.rfind('\n').map_or(0, |newline| newline + 1) + 1;
+    de::Error::custom(format_args!(
+      "unpaired UTF-16 surrogate in a string escape at line {line} column {column}"
+    ))
+  }
+
+  /// A field's value, decoded in the JSON type [`Field::shape`] declares
+  /// for it.
+  enum FieldValue {
+    /// [`Shape::String`]: the string as the answer wrote it.
+    String(String),
+    /// [`Shape::StringArray`]: the array's strings, in order, as the
+    /// answer wrote them.
+    Strings(Vec<String>),
+  }
+
+  impl FieldValue {
+    /// A string field's value as [`ImageAnalysis`] holds it: the string,
+    /// trimmed. `parse` asks this only of a string field's value, so the
+    /// empty label for an array is never reached.
+    fn into_label(self) -> SmolStr {
+      match self {
+        Self::String(string) => SmolStr::new(string.trim()),
+        Self::Strings(_) => SmolStr::default(),
+      }
+    }
+
+    /// An array field's value as [`ImageAnalysis`] holds it: each string
+    /// through [`push_label`], whole, because a label can itself contain a
+    /// comma (e.g. "red, white, and blue flag", "july 4, 2026"). `parse`
+    /// asks this only of an array field's value, so the empty list for a
+    /// string is never reached.
+    fn into_labels(self) -> Vec<SmolStr> {
+      let mut labels = Vec::new();
+      if let Self::Strings(strings) = self {
+        for string in &strings {
+          push_label(&mut labels, string);
         }
       }
+      labels
     }
-    values
+  }
+
+  /// `value` decoded in the JSON type `field`'s schema entry declares
+  /// ([`Field::shape`]), or `None` when it holds any other: `null`, a
+  /// boolean, a number, an object, a string where an array of strings is
+  /// declared, or an array where a string is declared or that holds
+  /// anything but strings. A JSON value's first byte names its type (`"`
+  /// a string, `[` an array, `{` an object, `t` or `f` a boolean, `n`
+  /// null, `-` or a digit a number), and only a value whose first byte
+  /// names the declared type is decoded. So neither a number's magnitude
+  /// nor a nested value's depth can fail a field: either is a wrong type,
+  /// refused by name like any other.
+  ///
+  /// An `Err` would mean `value` is not JSON, which [`parse_members`] has
+  /// already ruled out for the whole answer.
+  fn decode_field(field: Field, value: &RawValue) -> Result<Option<FieldValue>, serde_json::Error> {
+    Ok(match field.shape() {
+      Shape::String => decode_string(value)?.map(FieldValue::String),
+      Shape::StringArray => decode_strings(value)?.map(FieldValue::Strings),
+    })
+  }
+
+  /// `value` decoded when it is a JSON string, else `None`.
+  fn decode_string(value: &RawValue) -> Result<Option<String>, serde_json::Error> {
+    let json = value.get();
+    if json.starts_with('"') {
+      serde_json::from_str(json).map(Some)
+    } else {
+      Ok(None)
+    }
+  }
+
+  /// `value` decoded when it is a JSON array of strings, else `None`. Each
+  /// element is captured as a [`RawValue`] and decoded only once its first
+  /// byte shows a string.
+  fn decode_strings(value: &RawValue) -> Result<Option<Vec<String>>, serde_json::Error> {
+    let json = value.get();
+    if !json.starts_with('[') {
+      return Ok(None);
+    }
+    let items: Vec<&RawValue> = serde_json::from_str(json)?;
+    let mut strings = Vec::with_capacity(items.len());
+    for item in items {
+      match decode_string(item)? {
+        Some(string) => strings.push(string),
+        None => return Ok(None),
+      }
+    }
+    Ok(Some(strings))
   }
 
   /// Trims `raw`; pushes it onto `values` if non-empty and not already
@@ -1494,8 +1579,8 @@ Rules:
     }
 
     /// The reverse order: `categories: [...]` then `categories: null`.
-    /// Before this fix, collapse kept the *null* second copy, so
-    /// `unusable_fields` already rejected this order (as
+    /// Before this fix, collapse kept the *null* second copy, so the
+    /// field check already rejected this order (as
     /// `MissingFields`) — the asymmetry Codex R2 flagged. Both orders
     /// must now be refused the same way, for the same reason, this
     /// early: `DuplicateField`, not `MissingFields`.
@@ -1531,8 +1616,8 @@ Rules:
     }
 
     /// The reverse order: `scene: "beach"` then `scene: 42`. Before
-    /// this fix, collapse kept the *wrong-typed* second copy, so
-    /// `unusable_fields` already rejected this order (as
+    /// this fix, collapse kept the *wrong-typed* second copy, so the
+    /// field check already rejected this order (as
     /// `MissingFields`). Both orders must now be refused the same way,
     /// this early: `DuplicateField`, not `MissingFields`.
     #[test]
@@ -2043,8 +2128,8 @@ Rules:
     /// `MissingFields(["shot_type"])` error rather than the generic
     /// serde message the two engine copies produced ("expected a
     /// single shot_type label, got multiple values", wrapped as
-    /// `JsonParseError::Json`) — folded into `unusable_fields` like
-    /// every other shape violation.
+    /// `JsonParseError::Json`) — folded into the field check
+    /// (`usable_value`) like every other shape violation.
     #[test]
     fn reject_shot_type_multi_element_array_with_named_error() {
       let json_many = r#"{"scene":"x","description":"y","subjects":[],"objects":[],"actions":[],"emotion":[],"shot_type":["wide","close-up"],"lighting":[],"tags":["t"]}"#;
@@ -2088,7 +2173,7 @@ Rules:
       }
     }
 
-    /// Codex R1 (PR #5): `unusable_fields` used to exempt a *present*
+    /// Codex R1 (PR #5): the field check used to exempt a *present*
     /// `categories: null` from the shape check (it fell through a guard
     /// that only made sense back when a bare `!matches!(v, Value::Null)`
     /// meant "is this key even here" — categories was still optional at
@@ -2096,11 +2181,11 @@ Rules:
     /// the schema's `categories` entry allows only an array of strings,
     /// never null. Now that `categories` is a required field (see
     /// `categories_absent_is_rejected` above), a present `null` and a
-    /// totally absent key both fall through the exact same
-    /// `None | Some(Value::Null) => false` arm in `unusable_fields` and
-    /// produce the same named error — this test keeps the present-null
-    /// input shape pinned separately from the absent-key shape so a
-    /// future regression in either branch is still caught.
+    /// totally absent key produce the same named error through two
+    /// branches of `usable_value` (an absent member, and a value whose
+    /// first byte is not the declared type's) — this test keeps the
+    /// present-null input shape pinned separately from the absent-key
+    /// shape so a future regression in either branch is still caught.
     #[test]
     fn reject_present_null_categories_with_named_error() {
       let json = r#"{"scene":"office","description":"people working","subjects":["person"],"objects":[],"actions":[],"emotion":[],"shot_type":"wide","lighting":[],"tags":["work"],"categories":null}"#;
@@ -2167,14 +2252,13 @@ Rules:
     }
 
     /// Class-sweep addition (R1 follow-through, not itself a Codex
-    /// finding): `field_is_well_shaped`'s array arm checks
-    /// `items.iter().all(Value::is_string)`, enforcing the schema's
+    /// finding): `decode_field` decodes an array field only when every
+    /// element is a string, enforcing the schema's
     /// `items: {"type": "string"}` promise for every array-shaped field.
     /// That was already implemented but had no element-level regression
     /// — only a whole-field wrong type (`subjects: 42`, above) had
-    /// coverage, which exercises a different branch of
-    /// `field_is_well_shaped` than a well-typed array with one bad
-    /// element does.
+    /// coverage, which exercises a different branch of `decode_field`
+    /// than a well-typed array with one bad element does.
     #[test]
     fn reject_array_field_with_non_string_element() {
       let json = r#"{"scene":"office","description":"people working","subjects":["person",42],"objects":[],"actions":[],"emotion":[],"shot_type":"wide","lighting":[],"tags":["work"]}"#;
@@ -2701,16 +2785,21 @@ Rules:
         .collect()
     }
 
-    /// Asserts that the full roster refuses [`FULL_ANSWER`] with `key`'s
-    /// value replaced by `value` as `MissingFields` naming `key` alone.
-    fn assert_refused_by_name(key: &str, value: &str) {
+    /// [`FULL_ANSWER`] with `key`'s value replaced by `value`.
+    fn full_answer_with(key: &str, value: &str) -> String {
       let members = FULL_ANSWER.map(|(name, canonical)| {
         format!(
           r#""{name}":{}"#,
           if name == key { value } else { canonical }
         )
       });
-      match full_task().parse(&format!("{{{}}}", members.join(","))) {
+      format!("{{{}}}", members.join(","))
+    }
+
+    /// Asserts that the full roster refuses [`FULL_ANSWER`] with `key`'s
+    /// value replaced by `value` as `MissingFields` naming `key` alone.
+    fn assert_refused_by_name(key: &str, value: &str) {
+      match full_task().parse(&full_answer_with(key, value)) {
         Err(JsonParseError::MissingFields(fields)) => assert_eq!(
           fields,
           [key],
@@ -2833,6 +2922,362 @@ Rules:
         ] {
           assert_refused_by_name(key, value);
         }
+      }
+    }
+
+    // ===== every JSON text reaches the field checks =====
+
+    /// JSON numbers a `serde_json::Value` cannot hold (beyond `f64`'s range
+    /// either way, by exponent or by digits), numbers so small they round
+    /// to zero, and the other spellings JSON's grammar admits. Each is a
+    /// number, the wrong type for every field.
+    fn numbers() -> Vec<String> {
+      let mut numbers: Vec<String> = [
+        "1e400",
+        "-1e400",
+        "1E400",
+        "1e999999999999999999999",
+        "123456789012345678901234567890e300",
+        "1e-400",
+        "-1e-400",
+        "-0",
+        "1E5",
+        "1e+5",
+        "0.5e-3",
+      ]
+      .into_iter()
+      .map(String::from)
+      .collect();
+      numbers.push("9".repeat(400));
+      numbers
+    }
+
+    /// LAW: a number is refused by name in every string field, whatever its
+    /// magnitude or spelling: `1e400` is a JSON number as much as `1` is.
+    #[test]
+    fn a_number_of_any_magnitude_in_a_string_field_is_refused_by_name() {
+      for key in keys_declared_as("string") {
+        for number in numbers() {
+          assert_refused_by_name(key, &number);
+        }
+      }
+    }
+
+    /// LAW: a number is refused by name in every array field, whatever its
+    /// magnitude or spelling, as the field's value and as an element.
+    #[test]
+    fn a_number_of_any_magnitude_in_an_array_field_is_refused_by_name() {
+      for key in keys_declared_as("array") {
+        for number in numbers() {
+          for value in [
+            number.clone(),
+            format!("[{number}]"),
+            format!(r#"["label",{number}]"#),
+          ] {
+            assert_refused_by_name(key, &value);
+          }
+        }
+      }
+    }
+
+    /// LAW: a number under a key the schema does not declare is
+    /// `UnknownFields` naming the key, whatever its magnitude: as the
+    /// member's value, nested inside it, and under a switched-off
+    /// extension's key.
+    #[test]
+    fn a_number_of_any_magnitude_under_an_undeclared_key_is_unknown_fields() {
+      let task = ImageAnalysisTask::new();
+      for number in numbers() {
+        for (key, value) in [
+          ("extra", number.clone()),
+          ("extra", format!(r#"{{"nested":[{number}]}}"#)),
+          ("scene", number.clone()),
+        ] {
+          match task.parse(&format!(r#"{{{DEFAULT_MEMBERS},"{key}":{value}}}"#)) {
+            Err(JsonParseError::UnknownFields(fields)) => assert_eq!(fields, [key]),
+            other => panic!("{key} = {value} must be UnknownFields naming {key}, got {other:?}"),
+          }
+        }
+      }
+    }
+
+    /// LAW: a top-level value that is not an object names every field the
+    /// task asks for, whatever numbers it holds.
+    #[test]
+    fn a_top_level_value_that_is_not_an_object_names_every_asked_for_field() {
+      for (task, asked_for) in [
+        (ImageAnalysisTask::new(), vec!["description", "tags"]),
+        (full_task(), Field::ALL.map(Field::key).to_vec()),
+      ] {
+        for number in numbers() {
+          for answer in [
+            number.clone(),
+            format!("[{number}]"),
+            format!(r#"["label",{{"nested":{number}}}]"#),
+          ] {
+            match task.parse(&answer) {
+              Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, asked_for),
+              other => {
+                panic!("{answer} must be MissingFields naming every asked-for field, got {other:?}")
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /// LAW: a duplicated key is `DuplicateField` whatever JSON values its
+    /// copies hold.
+    #[test]
+    fn a_duplicated_key_is_named_whatever_its_copies_hold() {
+      for (answer, repeated) in [
+        (
+          r#"{"description":1e400,"description":"a","tags":["label"]}"#,
+          "description",
+        ),
+        (
+          r#"{"extra":[[[1e400]]],"extra":1,"description":"a","tags":["label"]}"#,
+          "extra",
+        ),
+      ] {
+        match ImageAnalysisTask::new().parse(answer) {
+          Err(JsonParseError::DuplicateField(key)) => assert_eq!(key, repeated),
+          other => panic!("{answer} must be DuplicateField naming {repeated}, got {other:?}"),
+        }
+      }
+    }
+
+    /// How deep the nesting law below nests: far past serde_json's own
+    /// recursion limit of 128, and deep enough that a reader recursing once
+    /// per level would exhaust a test thread's stack.
+    const DEPTH: usize = 100_000;
+
+    /// LAW: a value nested to any depth is a wrong type like any other. In
+    /// every field, as the value or as an array field's element, it is
+    /// `MissingFields` naming the field; under an undeclared key it is
+    /// `UnknownFields`; as the whole answer, an array names every
+    /// asked-for field and an object its undeclared key.
+    #[test]
+    fn a_value_nested_to_any_depth_is_refused_by_name() {
+      let nested_array = format!("{}{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
+      let nested_object = format!("{}null{}", r#"{"a":"#.repeat(DEPTH), "}".repeat(DEPTH));
+      let array_keys = keys_declared_as("array");
+      for (shape, nested) in [("array", &nested_array), ("object", &nested_object)] {
+        for (key, _) in FULL_ANSWER {
+          let mut values = vec![nested.clone()];
+          if array_keys.contains(&key) {
+            values.push(format!(r#"["label",{nested}]"#));
+          }
+          for value in values {
+            match full_task().parse(&full_answer_with(key, &value)) {
+              Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, [key]),
+              other => panic!(
+                "{key}: an {shape} nested {DEPTH} deep must be MissingFields naming {key}, got {other:?}"
+              ),
+            }
+          }
+        }
+        match ImageAnalysisTask::new().parse(&format!(r#"{{{DEFAULT_MEMBERS},"extra":{nested}}}"#))
+        {
+          Err(JsonParseError::UnknownFields(fields)) => assert_eq!(fields, ["extra"]),
+          other => panic!(
+            "an {shape} nested {DEPTH} deep under an undeclared key must be UnknownFields, got {other:?}"
+          ),
+        }
+      }
+      match ImageAnalysisTask::new().parse(&nested_array) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["description", "tags"]),
+        other => panic!(
+          "an array nested {DEPTH} deep as the answer must name every asked-for field, got {other:?}"
+        ),
+      }
+      match ImageAnalysisTask::new().parse(&nested_object) {
+        Err(JsonParseError::UnknownFields(fields)) => assert_eq!(fields, ["a"]),
+        other => panic!(
+          "an object nested {DEPTH} deep as the answer must name its undeclared key, got {other:?}"
+        ),
+      }
+    }
+
+    /// LAW: a string of any length reaches the field checks: a description
+    /// over its cap is refused by name, a long string under an undeclared
+    /// key is `UnknownFields`, and a long label, which no cap limits,
+    /// parses whole.
+    #[test]
+    fn a_string_of_any_length_reaches_the_field_checks() {
+      let long = "a".repeat(1_000_000);
+      let task = ImageAnalysisTask::new();
+      match task.parse(&format!(r#"{{"description":"{long}","tags":["label"]}}"#)) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["description"]),
+        other => panic!(
+          "a long description must be MissingFields, got {:?}",
+          other.map(|_| ())
+        ),
+      }
+      match task.parse(&format!(r#"{{{DEFAULT_MEMBERS},"extra":"{long}"}}"#)) {
+        Err(JsonParseError::UnknownFields(fields)) => assert_eq!(fields, ["extra"]),
+        other => panic!(
+          "a long string under an undeclared key must be UnknownFields, got {:?}",
+          other.map(|_| ())
+        ),
+      }
+      let analysis = task
+        .parse(&format!(
+          r#"{{"description":"A person reads.","tags":["{long}"]}}"#
+        ))
+        .expect("a label of any length parses");
+      assert!(analysis.tags() == [SmolStr::from(long.as_str())]);
+    }
+
+    /// LAW: the number spellings JSON's grammar admits reach the field
+    /// checks and are refused by the field's name; the spellings it does
+    /// not admit are not JSON.
+    #[test]
+    fn only_the_number_spellings_json_admits_reach_the_field_checks() {
+      let task = ImageAnalysisTask::new();
+      let answer = |number: &str| format!(r#"{{"description":{number},"tags":["label"]}}"#);
+      for number in ["-0", "1E5", "1e+5", "0.5e-3", "-0.0e-0", "1e400"] {
+        match task.parse(&answer(number)) {
+          Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["description"]),
+          other => panic!("{number} is a JSON number, refused by name; got {other:?}"),
+        }
+      }
+      for spelling in [
+        "01",
+        "+1",
+        ".5",
+        "1.",
+        "1e",
+        "1e+",
+        "-",
+        "--1",
+        "0x10",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+      ] {
+        assert!(
+          matches!(task.parse(&answer(spelling)), Err(JsonParseError::Json(_))),
+          "{spelling} is not a JSON number"
+        );
+      }
+    }
+
+    /// Strings that escape one half of a UTF-16 surrogate pair without the
+    /// other, as JSON string literals: a leading half alone, at the end and
+    /// before text; a trailing half alone; two leading halves; the halves
+    /// in the wrong order; a trailing half after a whole pair; and a
+    /// leading half before another escape. JSON's grammar admits each; no
+    /// Unicode text can hold one.
+    const LONE_SURROGATES: [&str; 7] = [
+      r#""\uD800""#,
+      r#""\uDBFFb""#,
+      r#""\uDC00""#,
+      r#""\uD800\uD800""#,
+      r#""\uDFFF\uD800""#,
+      r#""\uD83D\uDE00\uDC00""#,
+      r#""a\uD800\n""#,
+    ];
+
+    /// LAW: a string escaping half a surrogate pair is not JSON, wherever
+    /// it sits: in a string field, in an array field's element, inside a
+    /// value of the wrong type, under an undeclared key, nested there, as a
+    /// key, and in a top-level value that is not an object. `parse` decodes
+    /// few of those strings and refuses every one as `Json`, positioned at
+    /// the escape.
+    #[test]
+    fn a_string_escaping_half_a_surrogate_pair_is_not_json_wherever_it_sits() {
+      let task = ImageAnalysisTask::new();
+      for lone in LONE_SURROGATES {
+        for answer in [
+          format!(r#"{{"description":{lone},"tags":["label"]}}"#),
+          format!(r#"{{"description":"A person reads.","tags":["label",{lone}]}}"#),
+          format!(r#"{{"description":[{lone}],"tags":["label"]}}"#),
+          format!(r#"{{"description":"A person reads.","tags":[{{"label":{lone}}}]}}"#),
+          format!(r#"{{{DEFAULT_MEMBERS},"extra":{lone}}}"#),
+          format!(r#"{{{DEFAULT_MEMBERS},"extra":{{"nested":[{lone}]}}}}"#),
+          format!(r#"{{{DEFAULT_MEMBERS},{lone}:"label"}}"#),
+          format!("[{lone}]"),
+        ] {
+          assert!(
+            matches!(task.parse(&answer), Err(JsonParseError::Json(_))),
+            "{answer} is not JSON"
+          );
+        }
+      }
+      let answer = "{\"description\":\"A person reads.\",\n\"tags\":[\"\\uD800\"]}";
+      match task.parse(answer) {
+        Err(JsonParseError::Json(err)) => assert_eq!((err.line(), err.column()), (2, 10)),
+        other => panic!("{answer} must be Json at the escape, got {other:?}"),
+      }
+    }
+
+    /// LAW: a whole surrogate pair is text, and so is an escaped backslash
+    /// before `u`: the pair decodes to its one character, and `\\uD800` to
+    /// a backslash and the letters `uD800`.
+    #[test]
+    fn a_whole_surrogate_pair_and_an_escaped_backslash_are_text() {
+      let analysis = ImageAnalysisTask::new()
+        .parse(r#"{"description":"\uD83D\uDE00 A person smiles.","tags":["\\uD800"]}"#)
+        .expect("a surrogate pair and an escaped backslash are text");
+      assert_eq!(analysis.description(), "\u{1F600} A person smiles.");
+      assert_eq!(analysis.tags(), &[SmolStr::from(r"\uD800")][..]);
+    }
+
+    /// LAW: `find_lone_surrogate` flags exactly the string literals
+    /// serde_json cannot decode, and points at an escape when it flags one,
+    /// over every sequence of up to four pieces drawn from `\u` escapes on
+    /// each side of every surrogate boundary, the two-byte escapes, text
+    /// that spells a `\u` escape after an escaped backslash, and other
+    /// text.
+    #[test]
+    fn the_lone_surrogate_check_agrees_with_serde_json() {
+      const PIECES: [&str; 13] = [
+        r"\u0041", r"\uD7FF", r"\uD800", r"\uDBFF", r"\uDC00", r"\uDFFF", r"\uE000", r"\\",
+        r#"\""#, r"\n", r"\/", "uDC00", "é",
+      ];
+      let mut literals = Vec::new();
+      let mut bodies = vec![String::new()];
+      for length in 0..=4 {
+        literals.extend(bodies.iter().map(|body| format!(r#""{body}""#)));
+        if length < 4 {
+          bodies = bodies
+            .iter()
+            .flat_map(|body| PIECES.map(|piece| format!("{body}{piece}")))
+            .collect();
+        }
+      }
+      assert_eq!(literals.len(), 1 + 13 + 169 + 2197 + 28561);
+      for literal in &literals {
+        let decodes = serde_json::from_str::<String>(literal).is_ok();
+        let found = find_lone_surrogate(literal);
+        assert_eq!(
+          found.is_none(),
+          decodes,
+          "{literal}: serde_json decodes it: {decodes}; found {found:?}"
+        );
+        if let Some(escape) = found {
+          assert_eq!(literal.as_bytes()[escape], b'\\', "{literal}: {escape}");
+        }
+      }
+    }
+
+    /// LAW: an answer that is not JSON is `Json` before any other refusal.
+    /// A duplicated key, an undeclared key or a wrong type earlier in the
+    /// text does not stand in for the text not being JSON.
+    #[test]
+    fn an_answer_that_is_not_json_is_json_before_any_other_refusal() {
+      let task = ImageAnalysisTask::new();
+      for answer in [
+        r#"{"description":"a","description":"b","tags":["label"],}"#,
+        r#"{"description":"a","description":"b","tags":["\uD800"]}"#,
+        r#"{"extra":1e400,"description":"a","tags":["label"]"#,
+        r#"{"description":1e400,"tags":["label"]} trailing"#,
+      ] {
+        assert!(
+          matches!(task.parse(answer), Err(JsonParseError::Json(_))),
+          "{answer} is not JSON"
+        );
       }
     }
   }

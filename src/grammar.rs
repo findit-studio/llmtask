@@ -52,10 +52,20 @@ pub enum Grammar {
   /// must honour every keyword its schema uses: `type`, `properties`,
   /// `required`, `additionalProperties: false`, `items`, `maxLength`
   /// (a string's length in Unicode scalar values) and `maxItems` (an
-  /// array's element count). The task's `parse` checks the answer
-  /// against each of them again and refuses a violation by name, so an
-  /// engine that ignores a keyword surfaces as a parse error rather than
-  /// as silently over-long or reshaped output.
+  /// array's element count). The task's `parse` holds the answer to the
+  /// same keywords and to nothing looser, so it returns `Ok` only for an
+  /// answer the schema accepts: a JSON text, with nothing but JSON
+  /// whitespace around its value, in which every field has exactly the
+  /// JSON type the schema declares for it. A string where the schema
+  /// declares an array of strings (a comma-separated list included) and an
+  /// array where it declares a string (a one-element array included) are
+  /// refused like any other violation, by name, as
+  /// [`JsonParseError::MissingFields`](crate::JsonParseError::MissingFields);
+  /// an undeclared key is
+  /// [`JsonParseError::UnknownFields`](crate::JsonParseError::UnknownFields).
+  /// A decoder that enforces this schema never produces such a shape, so
+  /// `parse` tolerates none, and an engine that ignores a keyword surfaces
+  /// as a parse error rather than as silently over-long or reshaped output.
   #[cfg(feature = "json")]
   #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
   JsonSchema(serde_json::Value),

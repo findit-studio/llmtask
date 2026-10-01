@@ -21,6 +21,20 @@
   either cap as `JsonParseError::MissingFields` naming the field instead of
   truncating it. The `Grammar::JsonSchema` docs now list the keywords an
   engine serving `ImageAnalysisTask` must honour.
+- **Breaking:** `ImageAnalysisTask::parse` accepts each field only in the
+  JSON type its schema entry declares, so `Ok` means the answer satisfied the
+  schema. The drift tolerances are gone: a comma-separated string for `tags`,
+  a bare string for an array field (`subjects`, `objects`, `actions`,
+  `emotion`, `lighting`, `categories`) and a one-element array for
+  `shot_type` are each refused as `JsonParseError::MissingFields` naming the
+  field, like any other value of an undeclared type. The answer must also be
+  a JSON text: `parse` no longer trims whitespace JSON does not allow (a
+  no-break space, a line separator) from around the object, and refuses it
+  as `JsonParseError::Json`; JSON whitespace there still parses. A decoder
+  that enforces the schema (the `Grammar::JsonSchema` contract) never
+  produces any of those shapes. Leniency for an engine that does not
+  enforce the grammar, if it is ever wanted, is a separate, explicit
+  opt-in; none is built.
 
 ### Added
 - `image_analysis::Extension`, the closed set of the eight optional fields,

@@ -1,7 +1,7 @@
 //! `ImageAnalysis` — the canonical single-image VLM output type — and
 //! [`ImageAnalysisTask`] (behind the `json` feature) — the canonical
 //! `Task` implementation that produces it: prompt, JSON Schema, and a
-//! resilient parser tolerant of constrained-decoder output drift.
+//! parser that holds the answer to that schema.
 //!
 //! Both live here so every engine (`lfm`, `qwen3-vl`, and future
 //! consumers such as `mediagraph`'s VLM node) runs the exact same
@@ -397,10 +397,6 @@ Rules:
 - Use empty arrays or empty strings when a field is unknown.
 - Do not return markdown or any text outside the JSON object."#;
 
-  /// Separators `tags`' comma-separated string form is split on (see
-  /// [`extract_tags`]).
-  const TAG_SEPARATORS: [char; 3] = [',', ';', '\n'];
-
   /// The ten fields of the image-analysis JSON contract, in
   /// [`ImageAnalysis`] field order: the order a task's schema requires
   /// them in, its prompt describes them in, and its `parse` names them in.
@@ -447,6 +443,33 @@ Rules:
         Self::Categories => "categories",
       }
     }
+
+    /// The JSON type this field's schema entry declares, which is also the
+    /// only shape `parse` accepts for it.
+    const fn shape(self) -> Shape {
+      match self {
+        Self::Scene | Self::Description | Self::ShotType => Shape::String,
+        Self::Subjects
+        | Self::Objects
+        | Self::Actions
+        | Self::Emotion
+        | Self::Lighting
+        | Self::Tags
+        | Self::Categories => Shape::StringArray,
+      }
+    }
+  }
+
+  /// A field's JSON type. [`ImageAnalysisTask::build_schema`] declares it
+  /// and [`field_is_well_shaped`] accepts it and nothing else, both reading
+  /// it from [`Field::shape`], so `parse` cannot accept a shape the schema
+  /// does not declare.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  enum Shape {
+    /// `{"type": "string"}`.
+    String,
+    /// `{"type": "array", "items": {"type": "string"}}`.
+    StringArray,
   }
 
   /// One of the eight optional fields of the image-analysis contract. A
@@ -541,15 +564,17 @@ Rules:
   ///
   /// Both caps are stated in the schema (`maxLength` on `description`,
   /// `maxItems` on `tags`) and in the prompt. The constrained decoder
-  /// enforces them; `parse` checks them again and refuses an answer over
-  /// either cap as [`JsonParseError::MissingFields`] naming the field. It
-  /// never truncates or rewrites the model's words.
+  /// enforces the schema, caps included, and `parse` holds the answer to
+  /// the same schema: the keyword contract is on [`Grammar::JsonSchema`],
+  /// and a field that breaks it is refused as
+  /// [`JsonParseError::MissingFields`] naming the field. `parse` never
+  /// truncates or rewrites the model's words to make them fit.
   ///
   /// # Example
   ///
   /// ```
   /// use llmtask::{
-  ///   Task,
+  ///   JsonParseError, Task,
   ///   image_analysis::{Extension, ImageAnalysisTask},
   /// };
   ///
@@ -578,6 +603,15 @@ Rules:
   /// let analysis = task.parse(raw).expect("parse should succeed");
   /// assert_eq!(analysis.scene(), "office");
   /// assert_eq!(analysis.shot_type(), "wide shot");
+  ///
+  /// // Each field must have the JSON type the schema declares for it.
+  /// // `tags` is an array of strings, so one comma-separated string is
+  /// // refused by name rather than split.
+  /// let raw = r#"{"description": "Two people talk.", "tags": "office, meeting"}"#;
+  /// assert!(matches!(
+  ///   ImageAnalysisTask::new().parse(raw),
+  ///   Err(JsonParseError::MissingFields(fields)) if fields == ["tags"]
+  /// ));
   /// ```
   #[derive(Clone)]
   pub struct ImageAnalysisTask {
@@ -790,7 +824,8 @@ Rules:
     /// time, but `parse` cannot inherit for free: a `serde_json::Map`
     /// decode of already-generated text accepts any key regardless of what
     /// the schema says, so `parse` enforces this promise itself via
-    /// `unknown_fields`, and the caps via `unusable_fields`.
+    /// `unknown_fields`, and each field's type and cap via
+    /// `unusable_fields`.
     fn build_schema(&self) -> Value {
       let properties: Map<String, Value> = self
         .fields()
@@ -805,27 +840,26 @@ Rules:
       })
     }
 
-    /// `field`'s entry in the schema's `properties`. `description` and
-    /// `tags` carry the task's caps.
+    /// `field`'s entry in the schema's `properties`: the JSON type of its
+    /// [`Shape`], plus the task's cap on `description` and on `tags`.
     fn property_schema(&self, field: Field) -> Value {
+      let mut property = match field.shape() {
+        Shape::String => json!({ "type": "string" }),
+        Shape::StringArray => json!({ "type": "array", "items": { "type": "string" } }),
+      };
       match field {
-        Field::Description => json!({
-            "type": "string",
-            "maxLength": self.description_max_chars.get()
-        }),
-        Field::Tags => json!({
-            "type": "array",
-            "items": { "type": "string" },
-            "maxItems": self.tags_max_items.get()
-        }),
-        Field::Scene | Field::ShotType => json!({ "type": "string" }),
-        Field::Subjects
+        Field::Description => property["maxLength"] = self.description_max_chars.get().into(),
+        Field::Tags => property["maxItems"] = self.tags_max_items.get().into(),
+        Field::Scene
+        | Field::Subjects
         | Field::Objects
         | Field::Actions
         | Field::Emotion
+        | Field::ShotType
         | Field::Lighting
-        | Field::Categories => json!({ "type": "array", "items": { "type": "string" } }),
+        | Field::Categories => {}
       }
+      property
     }
 
     /// The prompt for the task: [`PROMPT_HEAD`], one paragraph per field
@@ -918,11 +952,11 @@ Rules:
     }
 
     /// Names the fields the task asks for that `object` leaves unusable:
-    /// absent or JSON `null`, present with a JSON type the field's shape
-    /// can't hold (e.g. a number where a string or array of strings is
-    /// expected), or over a cap the schema declares (see
-    /// [`Self::exceeds_cap`]). Keys outside the roster are a separate
-    /// concern, handled by [`Self::unknown_fields`].
+    /// absent or JSON `null`, present with any JSON type other than the
+    /// one the schema declares for the field (see [`field_is_well_shaped`]),
+    /// or over a cap the schema declares (see [`Self::exceeds_cap`]). Keys
+    /// outside the roster are a separate concern, handled by
+    /// [`Self::unknown_fields`].
     ///
     /// Folding "wrong type" into the same named-field list as
     /// "missing"/"null" is a deliberate hardening over the two engine
@@ -949,19 +983,14 @@ Rules:
     /// `true` iff `value` holds more than the cap `field`'s schema entry
     /// declares, counted the way the schema counts: `description` in
     /// Unicode scalar values of the string as the answer wrote it (before
-    /// `parse` trims it), `tags` in elements of the array. `tags`'
-    /// comma-separated string form — drift `parse` tolerates, see
-    /// [`extract_tags`] — counts the non-empty labels it lists, duplicates
-    /// included, as the array form would.
+    /// `parse` trims it), `tags` in elements of the array. Called only on a
+    /// value [`field_is_well_shaped`] accepted.
     fn exceeds_cap(&self, field: Field, value: &Value) -> bool {
       match (field, value) {
         (Field::Description, Value::String(description)) => {
           description.chars().count() > self.description_max_chars.get()
         }
         (Field::Tags, Value::Array(items)) => items.len() > self.tags_max_items.get(),
-        (Field::Tags, Value::String(list)) => {
-          tag_segments(list).count() > self.tags_max_items.get()
-        }
         _ => false,
       }
     }
@@ -996,7 +1025,10 @@ Rules:
       // Not a plain `serde_json::from_str` (see `parse_top_level_value`'s
       // doc comment): that collapses a duplicate top-level member — later
       // overwrites earlier — before any check below ever sees both copies.
-      let value: Value = parse_top_level_value(raw.trim())?;
+      // `raw` goes in untrimmed: the deserializer skips the JSON whitespace
+      // a JSON text may carry around its value, and any other character
+      // there is not JSON.
+      let value: Value = parse_top_level_value(raw)?;
       let Some(object) = value.as_object() else {
         // Not a JSON object at all: by definition every field the task
         // asks for is absent. Naming them via `MissingFields` is more
@@ -1024,23 +1056,23 @@ Rules:
         return Err(JsonParseError::MissingFields(unusable));
       }
       // Every field `unusable_fields` didn't flag is now known to carry
-      // a JSON shape its `extract_*` helper can consume, so extraction
-      // itself is infallible from here. A field the task does not ask for
-      // is never read and keeps its empty default.
+      // exactly the shape its schema entry declares, so extraction itself
+      // is infallible from here. A field the task does not ask for is
+      // never read and keeps its empty default.
       let mut result = ImageAnalysis::new();
       for field in self.fields() {
         let key = field.key();
         match field {
           Field::Scene => result.set_scene(extract_label(object, key)),
           Field::Description => result.set_description(extract_label(object, key)),
-          Field::Subjects => result.set_subjects(extract_detection_array(object, key)),
-          Field::Objects => result.set_objects(extract_detection_array(object, key)),
-          Field::Actions => result.set_actions(extract_detection_array(object, key)),
-          Field::Emotion => result.set_emotion(extract_detection_array(object, key)),
-          Field::ShotType => result.set_shot_type(extract_shot_type(object)),
-          Field::Lighting => result.set_lighting(extract_detection_array(object, key)),
-          Field::Tags => result.set_tags(extract_tags(object)),
-          Field::Categories => result.set_categories(extract_detection_array(object, key)),
+          Field::Subjects => result.set_subjects(extract_labels(object, key)),
+          Field::Objects => result.set_objects(extract_labels(object, key)),
+          Field::Actions => result.set_actions(extract_labels(object, key)),
+          Field::Emotion => result.set_emotion(extract_labels(object, key)),
+          Field::ShotType => result.set_shot_type(extract_label(object, key)),
+          Field::Lighting => result.set_lighting(extract_labels(object, key)),
+          Field::Tags => result.set_tags(extract_labels(object, key)),
+          Field::Categories => result.set_categories(extract_labels(object, key)),
         };
       }
       // Indexable-content gate. The prompt's rules instruct the model to
@@ -1093,7 +1125,7 @@ Rules:
   /// calls nothing else that builds a `Value` from text — no fenced-code
   /// stripping, no secondary lenient parse. `reject_fenced_json` and
   /// `reject_json_with_wrapper_text` (in the tests below) pass because
-  /// `raw.trim()` isn't valid/complete JSON on its own, not via a
+  /// `raw` isn't valid/complete JSON on its own, not via a
   /// different code path, so routing through here covers the whole parse
   /// surface — there is no second `from_str`/`from_value` call anywhere in
   /// this crate for a fenced or prose-wrapped variant to bypass.
@@ -1210,43 +1242,25 @@ Rules:
     }
   }
 
-  /// `true` iff `value`'s JSON type is one `field`'s extractor can
-  /// consume. Presence/null is checked separately by the caller
-  /// (`unusable_fields` treats an absent or `Value::Null` field as
-  /// unusable without consulting this function); this only judges the
-  /// shape of a value that's actually present and non-null.
+  /// `true` iff `value` has exactly the JSON type `field`'s schema entry
+  /// declares ([`Field::shape`]): a string, or an array whose every
+  /// element is a string. No other shape passes: not a string for an array
+  /// field, not an array for a string field, however short. Presence and
+  /// `null` are checked by the caller (`unusable_fields` treats an absent
+  /// or `Value::Null` field as unusable without consulting this function).
   fn field_is_well_shaped(field: Field, value: &Value) -> bool {
-    match field {
-      // `scene` / `description`: bare string only — no array-wrapping
-      // tolerance (unlike `shot_type` below).
-      Field::Scene | Field::Description => value.is_string(),
-      // `shot_type`: bare string, or the sole element of a one-element
-      // array (tolerates a constrained decoder that wraps a scalar).
-      Field::ShotType => match value {
-        Value::String(_) => true,
-        Value::Array(items) => items.len() == 1 && items[0].is_string(),
-        _ => false,
-      },
-      // Every array-shaped field: a JSON array of strings, or a bare
-      // string tolerated as a single-element array.
-      Field::Subjects
-      | Field::Objects
-      | Field::Actions
-      | Field::Emotion
-      | Field::Lighting
-      | Field::Tags
-      | Field::Categories => match value {
-        Value::String(_) => true,
-        Value::Array(items) => items.iter().all(Value::is_string),
-        _ => false,
-      },
+    match field.shape() {
+      Shape::String => value.is_string(),
+      Shape::StringArray => value
+        .as_array()
+        .is_some_and(|items| items.iter().all(Value::is_string)),
     }
   }
 
-  /// Extracts the trimmed string at `field` (`scene` / `description`),
-  /// or an empty `SmolStr` when absent/null. Caller must have already
-  /// confirmed via `unusable_fields` that a present value is a JSON
-  /// string.
+  /// Extracts a string field (`scene`, `description`, `shot_type`): the
+  /// string, trimmed. `parse` calls it only once `unusable_fields` has
+  /// confirmed the value is a JSON string, so the empty fallback is never
+  /// reached.
   fn extract_label(object: &Map<String, Value>, field: &str) -> SmolStr {
     match object.get(field) {
       Some(Value::String(s)) => SmolStr::new(s.trim()),
@@ -1254,77 +1268,22 @@ Rules:
     }
   }
 
-  /// Extracts `shot_type`: a bare string, or the sole element of a
-  /// one-element array. Caller must have already confirmed the shape.
-  fn extract_shot_type(object: &Map<String, Value>) -> SmolStr {
-    match object.get("shot_type") {
-      Some(Value::String(s)) => SmolStr::new(s.trim()),
-      Some(Value::Array(items)) => match items.first() {
-        Some(Value::String(s)) => SmolStr::new(s.trim()),
-        _ => SmolStr::default(),
-      },
-      _ => SmolStr::default(),
-    }
-  }
-
-  /// Extracts a detection-style label array (`subjects`, `objects`,
-  /// `actions`, `emotion`, `lighting`, `categories`): a JSON array
-  /// trims and dedupes each element verbatim — no comma-splitting,
-  /// because detection labels can themselves contain commas (e.g. "red,
-  /// white, and blue flag") — or a single JSON string wraps as one
-  /// label. Absent/null yields an empty list. Caller must have already
-  /// confirmed the shape via `unusable_fields`.
-  fn extract_detection_array(object: &Map<String, Value>, field: &str) -> Vec<SmolStr> {
+  /// Extracts an array field (`subjects`, `objects`, `actions`, `emotion`,
+  /// `lighting`, `tags`, `categories`): each element through
+  /// [`push_label`], whole, because a label can itself contain a comma
+  /// (e.g. "red, white, and blue flag", "july 4, 2026"). `parse` calls it
+  /// only once `unusable_fields` has confirmed the value is an array of
+  /// strings, so no element is ever skipped for its type.
+  fn extract_labels(object: &Map<String, Value>, field: &str) -> Vec<SmolStr> {
     let mut values = Vec::new();
-    match object.get(field) {
-      Some(Value::String(s)) => push_label(&mut values, s),
-      Some(Value::Array(items)) => {
-        for item in items {
-          if let Value::String(s) = item {
-            push_label(&mut values, s);
-          }
+    if let Some(Value::Array(items)) = object.get(field) {
+      for item in items {
+        if let Value::String(s) = item {
+          push_label(&mut values, s);
         }
       }
-      _ => {}
     }
     values
-  }
-
-  /// Extracts `tags`: like [`extract_detection_array`], but a JSON
-  /// string form is additionally split on [`TAG_SEPARATORS`] (see
-  /// [`tag_segments`]) — tag-list drift (model dropped the array around a
-  /// flat comma-separated string) is the historically common case for this
-  /// specific field. The array form is never split (a tag like "july 4,
-  /// 2026" must stay one entry).
-  fn extract_tags(object: &Map<String, Value>) -> Vec<SmolStr> {
-    let mut values = Vec::new();
-    match object.get("tags") {
-      Some(Value::String(s)) => {
-        for part in tag_segments(s) {
-          push_label(&mut values, part);
-        }
-      }
-      Some(Value::Array(items)) => {
-        for item in items {
-          if let Value::String(s) = item {
-            push_label(&mut values, s);
-          }
-        }
-      }
-      _ => {}
-    }
-    values
-  }
-
-  /// The labels `tags`' comma-separated string form lists: the trimmed,
-  /// non-empty parts between [`TAG_SEPARATORS`]. `extract_tags` reads
-  /// them and `ImageAnalysisTask::exceeds_cap` counts them, so both
-  /// agree on what one label is.
-  fn tag_segments(list: &str) -> impl Iterator<Item = &str> {
-    list
-      .split(TAG_SEPARATORS)
-      .map(str::trim)
-      .filter(|part| !part.is_empty())
   }
 
   /// Trims `raw`; pushes it onto `values` if non-empty and not already
@@ -1428,8 +1387,9 @@ Rules:
 
     /// A fenced markdown block around an otherwise-valid JSON object is
     /// rejected the same way as prose-wrapped JSON: this parser expects
-    /// `raw.trim()` to already be a bare JSON object, and does not strip
-    /// wrapping of any kind (fences included).
+    /// `raw` to already be a bare JSON text, one object with nothing but
+    /// JSON whitespace around it, and does not strip wrapping of any kind
+    /// (fences included).
     #[test]
     fn reject_fenced_json() {
       let text = "```json\n{\"scene\":\"office\",\"description\":\"People working\"}\n```";
@@ -1437,21 +1397,43 @@ Rules:
       assert!(task.parse(text).is_err());
     }
 
-    /// `tags` is always asked for, so the comma-separated tolerance holds
-    /// on the default task.
+    /// LAW: the answer is a JSON text. The JSON whitespace a JSON text may
+    /// carry around its value parses; any other whitespace there (a
+    /// no-break space, a line separator, an ideographic space, a vertical
+    /// tab) is not JSON and is refused as `JsonParseError::Json`, as a
+    /// fence or wrapper prose is.
     #[test]
-    fn parse_comma_separated_tag_string() {
+    fn only_json_whitespace_may_surround_the_answer() {
+      let task = ImageAnalysisTask::new();
+      let object = format!("{{{DEFAULT_MEMBERS}}}");
+      task
+        .parse(&format!(" \t\r\n{object} \t\r\n"))
+        .expect("JSON whitespace around the object is part of a JSON text");
+      for framed in [
+        format!("\u{a0}{object}"),
+        format!("{object}\u{a0}"),
+        format!("{object}\u{2028}"),
+        format!("\u{3000}{object}"),
+        format!("\u{b}{object}"),
+      ] {
+        assert!(
+          matches!(task.parse(&framed), Err(JsonParseError::Json(_))),
+          "{framed:?} is not a JSON text"
+        );
+      }
+    }
+
+    /// LAW: `tags` given as one comma-separated string is refused by name.
+    /// The schema declares an array of strings, and `parse` never splits a
+    /// string into labels.
+    #[test]
+    fn reject_comma_separated_tag_string() {
       let json = r#"{"description":"A singer on stage","tags":"concert, live music, spotlight"}"#;
       let task = ImageAnalysisTask::new();
-      let result = task.parse(json).expect("parse should succeed");
-      assert_eq!(
-        result.tags(),
-        &[
-          SmolStr::from("concert"),
-          SmolStr::from("live music"),
-          SmolStr::from("spotlight"),
-        ][..]
-      );
+      match task.parse(json) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["tags"]),
+        other => panic!("expected MissingFields naming tags alone, got {other:?}"),
+      }
     }
 
     #[test]
@@ -1604,17 +1586,17 @@ Rules:
       assert_eq!(result.subjects()[1], "b");
     }
 
+    /// LAW: `subjects` given as a bare string is refused by name. The
+    /// schema declares an array of strings, and `parse` never wraps a
+    /// string into one.
     #[test]
-    fn subjects_string_form_treated_as_single_label() {
+    fn reject_subjects_string_form() {
       let json = r#"{"scene":"x","description":"y","subjects":"middle-aged man, in red jacket","objects":[],"actions":[],"emotion":[],"shot_type":"x","lighting":[],"tags":["t"],"categories":[]}"#;
       let task = full_task();
-      let result = task.parse(json).expect("string-form parse");
-      assert_eq!(
-        result.subjects().len(),
-        1,
-        "string-form must wrap as a single label, not comma-split"
-      );
-      assert_eq!(result.subjects()[0], "middle-aged man, in red jacket");
+      match task.parse(json) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["subjects"]),
+        other => panic!("expected MissingFields naming subjects alone, got {other:?}"),
+      }
     }
 
     #[test]
@@ -2045,13 +2027,16 @@ Rules:
       assert_eq!(result.tags()[0].as_str(), "july 4, 2026");
     }
 
+    /// LAW: `shot_type` given as a one-element array is refused by name.
+    /// The schema declares a string, and `parse` never unwraps an array.
     #[test]
-    fn parse_shot_type_list_form() {
-      // shot_type accepts the list form `["wide shot"]` (one element).
+    fn reject_shot_type_list_form() {
       let json_one = r#"{"description":"y","shot_type":["wide shot"],"tags":["t"]}"#;
       let task = ImageAnalysisTask::new().with_extensions([Extension::ShotType]);
-      let result = task.parse(json_one).expect("single-element list parse");
-      assert_eq!(result.shot_type(), "wide shot");
+      match task.parse(json_one) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["shot_type"]),
+        other => panic!("expected MissingFields naming shot_type alone, got {other:?}"),
+      }
     }
 
     /// A multi-element `shot_type` array is now a named
@@ -2628,7 +2613,7 @@ Rules:
     /// An answer over a cap is refused by name, as a missing field is,
     /// and an answer at a cap parses whole: `parse` never truncates.
     /// `description` is counted in characters, not bytes, and as the answer
-    /// wrote it; `tags` in the labels it lists, in either form.
+    /// wrote it; `tags` in the elements of its array.
     #[test]
     fn an_answer_over_a_cap_is_refused_by_name_and_never_truncated() {
       let task = ImageAnalysisTask::new()
@@ -2659,16 +2644,8 @@ Rules:
         .parse(r#"{"description":"a","tags":["x","y","z"]}"#)
         .expect("three tags are at the cap");
       assert_eq!(analysis.tags().len(), 3);
-      let analysis = task
-        .parse(r#"{"description":"a","tags":"x, y, z,"}"#)
-        .expect("a trailing separator lists no fourth tag");
-      assert_eq!(analysis.tags().len(), 3);
       assert_eq!(
         refusal(r#"{"description":"a","tags":["x","y","z","w"]}"#),
-        ["tags"]
-      );
-      assert_eq!(
-        refusal(r#"{"description":"a","tags":"x, y, z, w"}"#),
         ["tags"]
       );
     }
@@ -2692,6 +2669,170 @@ Rules:
           task.with_accept_empty(true).parse(answer).is_ok(),
           "{answer} must parse when accept_empty is on"
         );
+      }
+    }
+
+    // ===== every field in exactly the shape its schema entry declares =====
+
+    /// A full-roster answer: every field present, non-empty, and of the
+    /// JSON type its schema entry declares.
+    const FULL_ANSWER: [(&str, &str); 10] = [
+      ("scene", r#""office""#),
+      ("description", r#""People work at their desks.""#),
+      ("subjects", r#"["office worker"]"#),
+      ("objects", r#"["desk"]"#),
+      ("actions", r#"["typing"]"#),
+      ("emotion", r#"["calm"]"#),
+      ("shot_type", r#""wide""#),
+      ("lighting", r#"["daylight"]"#),
+      ("tags", r#"["office"]"#),
+      ("categories", r#"["work"]"#),
+    ];
+
+    /// The keys of [`FULL_ANSWER`] whose type the full roster's emitted
+    /// schema declares as `declared` (`"string"` or `"array"`), in field
+    /// order.
+    fn keys_declared_as(declared: &str) -> Vec<&'static str> {
+      let task = full_task();
+      FULL_ANSWER
+        .iter()
+        .map(|&(key, _)| key)
+        .filter(|key| task.schema()["properties"][*key]["type"].as_str() == Some(declared))
+        .collect()
+    }
+
+    /// Asserts that the full roster refuses [`FULL_ANSWER`] with `key`'s
+    /// value replaced by `value` as `MissingFields` naming `key` alone.
+    fn assert_refused_by_name(key: &str, value: &str) {
+      let members = FULL_ANSWER.map(|(name, canonical)| {
+        format!(
+          r#""{name}":{}"#,
+          if name == key { value } else { canonical }
+        )
+      });
+      match full_task().parse(&format!("{{{}}}", members.join(","))) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(
+          fields,
+          [key],
+          "{key} = {value} must be refused naming {key} alone"
+        ),
+        other => panic!("{key} = {value} must be MissingFields naming {key} alone, got {other:?}"),
+      }
+    }
+
+    /// The baseline every refusal law below changes one field of: each value
+    /// of [`FULL_ANSWER`] has the JSON type the emitted schema declares for
+    /// its key, and the whole answer parses.
+    #[test]
+    fn the_full_answer_parses_in_every_declared_shape() {
+      let task = full_task();
+      for (key, value) in FULL_ANSWER {
+        let value: Value = serde_json::from_str(value).expect("a JSON value");
+        let declared = task.schema()["properties"][key]["type"].as_str();
+        let of_declared_type = match declared {
+          Some("string") => value.is_string(),
+          Some("array") => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string)),
+          _ => false,
+        };
+        assert!(
+          of_declared_type,
+          "{key}: {value} must be of the declared type {declared:?}"
+        );
+      }
+      let members = FULL_ANSWER.map(|(key, value)| format!(r#""{key}":{value}"#));
+      let analysis = task
+        .parse(&format!("{{{}}}", members.join(",")))
+        .expect("every field in its declared shape parses");
+      assert_eq!(analysis.shot_type(), "wide");
+      assert_eq!(analysis.subjects(), &[SmolStr::from("office worker")][..]);
+      assert_eq!(analysis.tags(), &[SmolStr::from("office")][..]);
+    }
+
+    /// LAW: a field the schema declares as an array of strings is refused
+    /// by name when the answer gives it a string instead, whether one label,
+    /// a comma-separated list or empty. `parse` neither wraps nor splits it.
+    #[test]
+    fn an_array_field_given_a_string_is_refused_by_name() {
+      let keys = keys_declared_as("array");
+      assert_eq!(
+        keys,
+        [
+          "subjects",
+          "objects",
+          "actions",
+          "emotion",
+          "lighting",
+          "tags",
+          "categories"
+        ]
+      );
+      for key in keys {
+        for value in [r#""label""#, r#""one, two; three""#, r#""""#] {
+          assert_refused_by_name(key, value);
+        }
+      }
+    }
+
+    /// LAW: a field the schema declares as a string is refused by name when
+    /// the answer gives it an array instead, a one-element array included.
+    /// `parse` never unwraps it.
+    #[test]
+    fn a_string_field_given_an_array_is_refused_by_name() {
+      let keys = keys_declared_as("string");
+      assert_eq!(keys, ["scene", "description", "shot_type"]);
+      for key in keys {
+        for value in [r#"["label"]"#, "[]", r#"["one","two"]"#] {
+          assert_refused_by_name(key, value);
+        }
+      }
+    }
+
+    /// LAW: `null` is refused by name for every field, an array field
+    /// included: the schema allows `null` nowhere.
+    #[test]
+    fn a_null_field_is_refused_by_name() {
+      for (key, _) in FULL_ANSWER {
+        assert_refused_by_name(key, "null");
+      }
+    }
+
+    /// LAW: a boolean or a number is refused by name for every field.
+    #[test]
+    fn a_boolean_or_number_field_is_refused_by_name() {
+      for (key, _) in FULL_ANSWER {
+        for value in ["true", "false", "0", "42", "-1.5"] {
+          assert_refused_by_name(key, value);
+        }
+      }
+    }
+
+    /// LAW: an object is refused by name for every field: the schema
+    /// declares no object-valued field.
+    #[test]
+    fn an_object_field_is_refused_by_name() {
+      for (key, _) in FULL_ANSWER {
+        for value in ["{}", r#"{"label":"office"}"#] {
+          assert_refused_by_name(key, value);
+        }
+      }
+    }
+
+    /// LAW: an array field is refused by name when any element is not a
+    /// string: `null`, a boolean, a number, an array or an object.
+    #[test]
+    fn an_array_field_with_an_element_that_is_not_a_string_is_refused_by_name() {
+      for key in keys_declared_as("array") {
+        for value in [
+          r#"["label",null]"#,
+          r#"["label",true]"#,
+          r#"["label",42]"#,
+          r#"["label",["nested"]]"#,
+          r#"["label",{"label":"office"}]"#,
+        ] {
+          assert_refused_by_name(key, value);
+        }
       }
     }
   }

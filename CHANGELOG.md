@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- `image_analysis::Extension` spells its name, the field's JSON key, on
+  every road, so a document can list the extensions a deployment switches
+  on (`["scene", "shot_type"]`): `Display` writes the name `as_str`
+  returns, `FromStr` and `TryFrom<&str>` read it back, and with the `serde`
+  feature `Serialize` / `Deserialize` carry it as a string. A name is read
+  exactly as written; any other, `description` and `tags` included, is
+  refused as the new `image_analysis::UnknownExtension`, which carries the
+  name and whose message lists the eight. `Extension::NAMES` lists the
+  eight names in `Extension::ALL` order.
+
 ## [0.4.0] - 2026-10-01
 
 ### Changed

@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Added
+- `DescriptionEnd` (`Whole`, `Sentence`, `Ragged`; `#[non_exhaustive]`)
+  and `ImageAnalysis::description_end` with its `with_` / `set_` pair: how
+  the description ends. The `serde` shape gains the `description_end` key
+  (snake-case names), read as `whole` when a document has none.
+
+### Fixed
+- `ImageAnalysisTask::parse` settles a description that reached
+  `description_max_chars` instead of returning it as the decoder closed
+  it. A constrained decoder ends the string at the schema's `maxLength`
+  wherever the sentence had got to, and its last token there is whatever
+  single character still fitted: with the default 120-character cap about
+  17% of LFM2.5-VL captions ended mid-clause and some in a lone CJK
+  character (`…facing forward with a neutral,略`;
+  findit-studio/application#235). Such a description now loses the
+  partial token the cap left (trailing U+FFFD, and a lone CJK letter after
+  text that is not one), keeps a sentence end it reached (`.`, `!`, `?`,
+  `。`, `！`, `？`, closing quotes and brackets after it allowed), or is cut
+  back to its last sentence end; with no sentence end in it at all it is
+  kept whole and marked `DescriptionEnd::Ragged`, never emptied. A
+  description short of the cap is unchanged, and one over it is still
+  refused by name.
+
 ## [0.4.1] - 2026-10-01
 
 ### Added

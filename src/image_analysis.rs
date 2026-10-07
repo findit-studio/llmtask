@@ -1187,15 +1187,24 @@ Rules:
   /// string it ends ([`Self::with_cut`]). The account names the suffix by
   /// its BYTES, never by a position: a position moves when the text is
   /// trimmed, and a second parse would read it in other coordinates. And it
-  /// describes that one string: a description that is not it — a settled
-  /// one, shorter by the suffix or by its trimming — is never cut again. A
-  /// flag saying only *that* a token was cut is not an account of which
-  /// bytes: with none, nothing is removed.
+  /// describes that one string, which it holds whole ([`Self::source`]) and
+  /// is bound to byte for byte: a description that is not exactly it is
+  /// never cut — a settled one, shorter by the suffix or by its trimming;
+  /// another description of the same length; an account left from a retry,
+  /// or taken for another answer in a batch. A flag saying only *that* a
+  /// token was cut is not an account of which bytes: with none, nothing is
+  /// removed.
   #[derive(Debug, Clone, PartialEq, Eq, Hash)]
   pub struct FieldEnd {
     closed_at_cap: bool,
-    /// The cut token's text, and the byte length of the string it ends.
-    cut: Option<(SmolStr, usize)>,
+    cut: Option<Cut>,
+  }
+
+  /// A cut last token: its text, and the whole string it ends.
+  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+  struct Cut {
+    suffix: SmolStr,
+    source: SmolStr,
   }
 
   impl FieldEnd {
@@ -1223,7 +1232,14 @@ Rules:
     /// [`Self::with_cut`].
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub fn cut(&self) -> Option<&str> {
-      self.cut.as_ref().map(|(suffix, _)| suffix.as_str())
+      self.cut.as_ref().map(|cut| cut.suffix.as_str())
+    }
+
+    /// The whole string the cut token ends, when the decoder named one —
+    /// the one description this account settles; see [`Self::with_cut`].
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn source(&self) -> Option<&str> {
+      self.cut.as_ref().map(|cut| cut.source.as_str())
     }
 
     /// Builder-style setter for [`Self::cut`]: the last token of `field`
@@ -1234,18 +1250,25 @@ Rules:
     /// The decoder passes the string **exactly as the answer carries it**
     /// — JSON-decoded, untrimmed — as `field`, and the last token's text
     /// exactly as `field` ends with it — the detokenizer's U+FFFD included
-    /// — as `suffix`. A description closed at the cap loses exactly those
-    /// bytes, and only when it is `field` (by its length) and ends with
-    /// them and keeps text before them; anything else (a suffix the text
-    /// does not end with, an empty one, one that is the whole text, a
-    /// description that is not `field`) removes nothing. So settling is
-    /// idempotent by construction: a settled description is shorter than
-    /// `field`, or is `field` itself left whole. Only the grammar's close
-    /// cuts a token, so the model's own end ([`Self::MODEL`]) ignores it.
+    /// — as `suffix`. The account keeps `field` whole ([`Self::source`]):
+    /// it is at most the cap, and only a capped string carries one. A
+    /// description closed at the cap loses exactly those bytes, and only
+    /// when it is `field` exactly, byte for byte, and ends with them and
+    /// keeps text before them; anything else (a suffix the text does not end
+    /// with, an empty one, one that is the whole text, a description that is
+    /// not exactly `field` — of the same length or not) removes nothing and
+    /// keeps the trimmed text. So settling is idempotent by construction: a
+    /// settled description is shorter than `field`, or is `field` itself
+    /// left whole, which the same decision settles again. Only the grammar's
+    /// close cuts a token, so the model's own end ([`Self::MODEL`]) ignores
+    /// it.
     #[cfg_attr(not(tarpaulin), inline(always))]
     #[must_use]
     pub fn with_cut(mut self, field: &str, suffix: &str) -> Self {
-      self.cut = Some((SmolStr::new(suffix), field.len()));
+      self.cut = Some(Cut {
+        suffix: SmolStr::new(suffix),
+        source: SmolStr::new(field),
+      });
       self
     }
   }
@@ -1466,11 +1489,12 @@ Rules:
       if !ended.closed_at_cap() {
         return (SmolStr::new(written.trim()), DescriptionEnd::Whole);
       }
+      // The account settles the one string it holds, byte for byte.
       let kept = ended
         .cut
         .as_ref()
-        .filter(|(suffix, field_len)| !suffix.is_empty() && written.len() == *field_len)
-        .and_then(|(suffix, _)| written.strip_suffix(suffix.as_str()))
+        .filter(|cut| !cut.suffix.is_empty() && written == cut.source)
+        .and_then(|cut| written.strip_suffix(cut.suffix.as_str()))
         .map(str::trim)
         .filter(|kept| !kept.is_empty())
         .unwrap_or_else(|| written.trim());
@@ -4055,6 +4079,31 @@ Rules:
       );
     }
 
+    /// LAW (Codex R5, [medium]): **an account settles only the string it was
+    /// taken from, byte for byte.** One taken for `abc�` (the suffix `�`)
+    /// removes nothing from `xyz�`, which has its length and ends with its
+    /// suffix — a stale account after a retry, or one misassociated in a
+    /// batch — nor from a description of another length; `abc�` itself
+    /// still loses the `�`.
+    #[test]
+    fn an_account_settles_only_the_string_it_was_taken_from() {
+      let end = FieldEnd::CAP.with_cut("abc\u{FFFD}", "\u{FFFD}");
+      assert_eq!(end.source(), Some("abc\u{FFFD}"));
+      assert_eq!(end.cut(), Some("\u{FFFD}"));
+      for written in ["xyz\u{FFFD}", "abcd\u{FFFD}", " abc\u{FFFD}"] {
+        assert_eq!(
+          settled(&capped_at(written), written, Some(end.clone())),
+          (written.trim().into(), crate::DescriptionEnd::Ragged),
+          "{written:?} is not the account's string"
+        );
+      }
+      assert_eq!(
+        settled(&capped_at("abc\u{FFFD}"), "abc\u{FFFD}", Some(end)),
+        ("abc".into(), crate::DescriptionEnd::Ragged),
+        "the account's own string loses the named bytes"
+      );
+    }
+
     /// LAW (Codex R3, [high]): **a trimmed description re-settles to
     /// itself.** The account names the suffix by its bytes, so trimming
     /// moves nothing it means. The review's cap-7 `" abcdef"`, named whole
@@ -4094,13 +4143,15 @@ Rules:
       }
     }
 
-    /// LAW (Codex R1–R3): settling is idempotent — a settled description
+    /// LAW (Codex R1–R5): settling is idempotent — a settled description
     /// parsed again with the same account settles to itself, and parsed
     /// without one is kept as it stands — over the fixtures, and as a
     /// property over pseudo-random pairs of a text and a suffix drawn from
     /// spaces, ASCII, CJK and U+FFFD, where the settled text is always
     /// either the text trimmed or the text less exactly the named suffix,
-    /// trimmed.
+    /// trimmed. The account is bound to its text byte for byte (R5): the
+    /// same text with one letter swapped for another of its byte length
+    /// settles to itself trimmed under that account.
     #[test]
     fn settling_is_idempotent() {
       let once_more = |written: &str, end: FieldEnd| {
@@ -4147,6 +4198,26 @@ Rules:
         assert!(
           settled == text.trim() || less == Some(settled.as_str()),
           "{text:?} less {suffix:?} settled to {settled:?}"
+        );
+        // Another text of the same byte length: one letter swapped for
+        // another as long.
+        let other = [
+          ("a", "b"),
+          ("b", "a"),
+          ("日", "本"),
+          ("本", "日"),
+          ("語", "日"),
+        ]
+        .into_iter()
+        .find(|(from, _)| text.contains(from))
+        .map(|(from, to)| text.replacen(from, to, 1))
+        .expect("the text holds a letter");
+        assert_eq!(other.len(), text.len());
+        let end = FieldEnd::CAP.with_cut(&text, &suffix);
+        assert_eq!(
+          once_more(&other, end),
+          (other.trim().into(), crate::DescriptionEnd::Ragged),
+          "{other:?} under the account of {text:?} less {suffix:?}"
         );
       }
     }

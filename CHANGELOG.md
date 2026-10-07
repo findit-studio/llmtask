@@ -21,7 +21,7 @@ The next release is 0.5.0: `ImageAnalysis` changes its serialized layout.
   nothing about the new one; a caller with the decoder's account sets it
   afterwards.
 - `image_analysis::FieldEnd` (`FieldEnd::MODEL`, `FieldEnd::CAP`, `cut`,
-  `with_cut`) and `ImageAnalysisTask::parse_with_description_end`
+  `source`, `with_cut`) and `ImageAnalysisTask::parse_with_description_end`
   (findit-studio/application#235). A constrained decoder ends the
   description at the schema's `maxLength` wherever the sentence had got to,
   and only the decoder knows whether it closed the string there or the
@@ -29,11 +29,13 @@ The next release is 0.5.0: `ImageAnalysis` changes its serialized layout.
   way. `FieldEnd` is the decoder's account — whether the grammar closed the
   string at the cap, and, when the string's last token was cut, that
   token's text, named against the string it ends (`with_cut(field,
-  suffix)`) — and `parse_with_description_end` settles the description by
-  it: the model's own end is `Whole` at any length; a string closed at the
-  cap is `Ragged`, kept as written less exactly the named bytes, and only
-  when the description is that string, ends with them and keeps text
-  before them. The account names the suffix by its bytes, never by a
+  suffix)`, which keeps the string whole) — and `parse_with_description_end`
+  settles the description by it: the model's own end is `Whole` at any
+  length; a string closed at the cap is `Ragged`, kept as written less
+  exactly the named bytes, and only when the description is that string
+  byte for byte, ends with them and keeps text before them. An account
+  taken for another string — of the same length or not, left from a retry
+  or misassociated in a batch — removes nothing. The account names the suffix by its bytes, never by a
   position, so trimming moves nothing it means, and a settled description
   — shorter than the string, or the string left whole — re-settles to
   itself. The parser never cuts a description back to a sentence end;

@@ -108,30 +108,39 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `description`. Pass an empty string to clear.
+  ///
+  /// Resets [`description_end`](Self::description_end) to
+  /// [`DescriptionEnd::Unknown`], as [`Self::set_description`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_description(mut self, val: impl Into<SmolStr>) -> Self {
-    self.description = val.into();
+    self.set_description(val);
     self
   }
 
   /// In-place setter for `description`. Pass an empty string to clear.
+  ///
+  /// Resets [`description_end`](Self::description_end) to
+  /// [`DescriptionEnd::Unknown`]: how the old text ended says nothing about
+  /// the new one, so a caller holding the decoder's account of the new
+  /// text sets it afterwards.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_description(&mut self, val: impl Into<SmolStr>) -> &mut Self {
     self.description = val.into();
+    self.description_end = DescriptionEnd::Unknown;
     self
   }
 
   // --- description_end ---
 
-  /// How the description ends: where its writer ended it, trimmed back
-  /// to a sentence end, or ragged where a length cap stopped it. See
-  /// [`DescriptionEnd`].
+  /// How the description ends: where its writer ended it, or ragged where
+  /// a length cap stopped it — or unknown. See [`DescriptionEnd`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn description_end(&self) -> DescriptionEnd {
     self.description_end
   }
 
-  /// Builder-style setter for `description_end`.
+  /// Builder-style setter for `description_end`. Set it after the
+  /// description: setting the description resets it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_description_end(mut self, val: DescriptionEnd) -> Self {
     self.description_end = val;
@@ -336,6 +345,10 @@ impl ImageAnalysis {
 /// account ([`FieldEnd`], handed to
 /// `ImageAnalysisTask::parse_with_description_end`), and without one it
 /// is [`Unknown`](Self::Unknown) and the text is kept as written.
+///
+/// The parser never cuts a description back: whether a ragged one still
+/// holds whole sentences is a reading of its text, a consumer's choice to
+/// make over the marked text, never the parser's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -348,13 +361,9 @@ pub enum DescriptionEnd {
   Unknown,
   /// The model ended the description itself, whatever its length.
   Whole,
-  /// The grammar closed the description at the cap on a sentence end, or
-  /// it was cut back to its last unambiguous one (the task's
-  /// `sentence_cut_back`), so it holds whole sentences.
-  Sentence,
-  /// The grammar closed the description at the cap mid-sentence. It is
-  /// kept whole — less a last token the decoder reports it cut — and ends
-  /// where the cap stopped it.
+  /// The grammar closed the description at the cap: it ends where the cap
+  /// stopped it, kept as written — less only the bytes of a last token the
+  /// decoder names as cut ([`FieldEnd::with_cut_at`]).
   Ragged,
 }
 
@@ -390,6 +399,39 @@ mod tests {
     assert_eq!(s.emotion().len(), 1);
     assert_eq!(s.tags().len(), 3);
     assert_eq!(s.categories().len(), 1);
+  }
+
+  /// LAW (Codex R2, [medium]): **setting or clearing the description
+  /// resets how it ends.** The mark describes the text it was settled
+  /// with; a new text — or none — is `Unknown` until a caller with the
+  /// decoder's account sets it again.
+  #[test]
+  fn the_description_mutators_reset_how_it_ends() {
+    let ragged = ImageAnalysis::new()
+      .with_description("A cat sleeps on a")
+      .with_description_end(DescriptionEnd::Ragged);
+    assert_eq!(ragged.description_end(), DescriptionEnd::Ragged);
+    assert_eq!(
+      ragged
+        .clone()
+        .with_description("A cat sleeps on a rug.")
+        .description_end(),
+      DescriptionEnd::Unknown
+    );
+    let mut set = ragged.clone();
+    set.set_description("A cat sleeps.");
+    assert_eq!(set.description_end(), DescriptionEnd::Unknown);
+    let mut cleared = ragged;
+    cleared.set_description("");
+    assert_eq!(cleared.description_end(), DescriptionEnd::Unknown);
+    assert_eq!(
+      cleared
+        .with_description("A cat.")
+        .with_description_end(DescriptionEnd::Whole)
+        .description_end(),
+      DescriptionEnd::Whole,
+      "set after the text, the mark stands"
+    );
   }
 
   /// A document written before `description_end` existed reads as an
@@ -893,7 +935,6 @@ Rules:
     description_max_chars: NonZeroUsize,
     tags_max_items: NonZeroUsize,
     accept_empty: bool,
-    sentence_cut_back: bool,
     // Both derived from `extensions` and the two caps by `rebuild`, which
     // every setter of those three calls, so the schema, the prompt and
     // `parse` always describe the same roster.
@@ -927,7 +968,6 @@ Rules:
         description_max_chars: Self::DEFAULT_DESCRIPTION_MAX_CHARS,
         tags_max_items: Self::DEFAULT_TAGS_MAX_ITEMS,
         accept_empty: false,
-        sentence_cut_back: false,
         schema: Value::Null,
         prompt: String::new(),
       };
@@ -1067,49 +1107,11 @@ Rules:
       self
     }
 
-    // --- sentence_cut_back ---
-
-    /// Whether a description the decoder reports it closed at the cap
-    /// mid-sentence is cut back to its last UNAMBIGUOUS sentence end. Off
-    /// by default: the cut drops words, and only a boundary no reading
-    /// could take for anything else qualifies — see
-    /// [`Self::with_sentence_cut_back`].
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub const fn sentence_cut_back(&self) -> bool {
-      self.sentence_cut_back
-    }
-
-    /// Builder-style setter for `sentence_cut_back`.
-    ///
-    /// When on, [`Self::parse_with_description_end`] cuts a description
-    /// the decoder closed at the cap back to its last unambiguous sentence
-    /// end, marked [`DescriptionEnd::Sentence`]. A boundary is unambiguous
-    /// when a `.`, `!` or `?` stands outside double quotes, is followed by
-    /// whitespace and a capital letter, and — for a `.` — does not end an
-    /// abbreviation (`Dr.`, `e.g.`) or an initial (`J.`); or when a `。`,
-    /// `！` or `？` stands outside CJK and double quotes. Punctuation that
-    /// closes a quotation (`"Ready?" while…`) is never one. A description
-    /// with no such boundary is kept whole, [`DescriptionEnd::Ragged`].
-    /// Without the decoder's account nothing is ever cut.
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub const fn with_sentence_cut_back(mut self, val: bool) -> Self {
-      self.sentence_cut_back = val;
-      self
-    }
-
-    /// In-place setter for `sentence_cut_back`. See
-    /// [`Self::with_sentence_cut_back`].
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub const fn set_sentence_cut_back(&mut self, val: bool) -> &mut Self {
-      self.sentence_cut_back = val;
-      self
-    }
-
     // --- parsing with the decoder's account ---
 
     /// [`Task::parse`], with the constrained decoder's account of how it
     /// ended the description: whether the grammar closed it at the
-    /// field's `maxLength`, and whether the last token's bytes were cut.
+    /// field's `maxLength`, and where a last token it names as cut begins.
     ///
     /// `Task::parse` has the answer's text alone, and text cannot tell a
     /// string the grammar closed at the cap from one the model ended at
@@ -1118,16 +1120,19 @@ Rules:
     ///
     /// - the model ended it: kept as written, [`DescriptionEnd::Whole`],
     ///   whatever its length;
-    /// - the grammar closed it at the cap: the trailing U+FFFD of a last
-    ///   token the decoder reports it cut goes (and nothing else is ever
-    ///   removed for its script); a description that then ends on an
-    ///   unambiguous sentence end is [`DescriptionEnd::Sentence`]; with
-    ///   [`sentence_cut_back`](Self::sentence_cut_back) on, one that does
-    ///   not is cut back to its last unambiguous one, else kept whole and
-    ///   [`DescriptionEnd::Ragged`] — never emptied.
+    /// - the grammar closed it at the cap: kept as written,
+    ///   [`DescriptionEnd::Ragged`] — less the suffix from
+    ///   [`FieldEnd::cut_at`] on, the bytes of a last token the decoder
+    ///   names as cut, and only when that boundary falls inside the text
+    ///   on a character boundary and leaves text before it.
     ///
-    /// Settling is idempotent: a settled description parsed again with
-    /// the same account settles to itself.
+    /// That suffix is the one change a parse may make to a description's
+    /// text. Nothing is removed for its script, its punctuation or its
+    /// length, and nothing is cut back to a sentence end: whether a ragged
+    /// description holds whole sentences is a consumer's reading of the
+    /// marked text. Settling is idempotent: a settled description parsed
+    /// again with the same account settles to itself, since the boundary
+    /// then falls at or past its end.
     ///
     /// # Errors
     ///
@@ -1146,10 +1151,21 @@ Rules:
   /// description by. An engine that decodes under the task's grammar
   /// knows it at the step it closes the string; the answer's text does
   /// not carry it.
+  ///
+  /// # What an engine reports
+  ///
+  /// Whether the grammar closed the string at its `maxLength`
+  /// ([`Self::CAP`]) or the model did ([`Self::MODEL`]); and, when the
+  /// string's last token was cut — its bytes an incomplete sequence the
+  /// detokenizer decoded as U+FFFD — where that token's text begins
+  /// ([`Self::with_cut_at`]): a byte offset into the string as the answer
+  /// carries it (JSON-decoded, before any trimming), everything from which
+  /// is that token's. A flag saying only *that* a token was cut is not an
+  /// account of which bytes: with none, nothing is removed.
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
   pub struct FieldEnd {
     closed_at_cap: bool,
-    last_token_cut: bool,
+    cut_at: Option<usize>,
   }
 
   impl FieldEnd {
@@ -1157,14 +1173,14 @@ Rules:
     /// go on.
     pub const MODEL: Self = Self {
       closed_at_cap: false,
-      last_token_cut: false,
+      cut_at: None,
     };
 
     /// The grammar closed the string at the field's `maxLength`: the model
     /// was left no choice but to end it there.
     pub const CAP: Self = Self {
       closed_at_cap: true,
-      last_token_cut: false,
+      cut_at: None,
     };
 
     /// Whether the grammar closed the string at the field's `maxLength`.
@@ -1173,18 +1189,22 @@ Rules:
       self.closed_at_cap
     }
 
-    /// Whether the string's last token was cut short — its partial UTF-8
-    /// sequence decoded as U+FFFD.
+    /// Where the cut last token's text begins, in bytes of the string as
+    /// the answer carries it, when the decoder named one.
     #[cfg_attr(not(tarpaulin), inline(always))]
-    pub const fn last_token_cut(&self) -> bool {
-      self.last_token_cut
+    pub const fn cut_at(&self) -> Option<usize> {
+      self.cut_at
     }
 
-    /// Builder-style setter for [`Self::last_token_cut`].
+    /// Builder-style setter for [`Self::cut_at`]: the string's last token
+    /// was cut, and its text begins at byte `boundary` — the suffix from
+    /// there on is that token's bytes, and a string closed at the cap
+    /// loses it. Only the grammar's close cuts a token, so the model's own
+    /// end ([`Self::MODEL`]) ignores it.
     #[cfg_attr(not(tarpaulin), inline(always))]
     #[must_use]
-    pub const fn with_last_token_cut(mut self, cut: bool) -> Self {
-      self.last_token_cut = cut;
+    pub const fn with_cut_at(mut self, boundary: usize) -> Self {
+      self.cut_at = Some(boundary);
       self
     }
   }
@@ -1394,126 +1414,25 @@ Rules:
     /// `written`, the description as the answer wrote it, as
     /// [`ImageAnalysis`] holds it, and how it ends ([`DescriptionEnd`]),
     /// settled by the decoder's account `ended` — see
-    /// [`Self::parse_with_description_end`]. Without one the text is kept
-    /// as written: nothing is inferred from its length or its script.
-    fn settle_description(
-      &self,
-      written: &str,
-      ended: Option<FieldEnd>,
-    ) -> (SmolStr, DescriptionEnd) {
-      let whole = written.trim();
+    /// [`Self::parse_with_description_end`]. The text is kept as written,
+    /// trimmed as every parse trims it, except for the one suffix a cap's
+    /// account names by its boundary: nothing is inferred from the text's
+    /// length, its script or its punctuation.
+    fn settle_description(written: &str, ended: Option<FieldEnd>) -> (SmolStr, DescriptionEnd) {
       let Some(ended) = ended else {
-        return (SmolStr::new(whole), DescriptionEnd::Unknown);
+        return (SmolStr::new(written.trim()), DescriptionEnd::Unknown);
       };
       if !ended.closed_at_cap() {
-        return (SmolStr::new(whole), DescriptionEnd::Whole);
+        return (SmolStr::new(written.trim()), DescriptionEnd::Whole);
       }
-      let kept = if ended.last_token_cut() {
-        whole
-          .trim_end_matches(char::REPLACEMENT_CHARACTER)
-          .trim_end()
-      } else {
-        whole
-      };
-      if kept.is_empty() {
-        return (SmolStr::new(whole), DescriptionEnd::Ragged);
-      }
-      if ends_a_sentence(kept) {
-        return (SmolStr::new(kept), DescriptionEnd::Sentence);
-      }
-      if self.sentence_cut_back
-        && let Some(end) = last_sentence_end(kept)
-      {
-        return (
-          SmolStr::new(kept[..end].trim_end()),
-          DescriptionEnd::Sentence,
-        );
-      }
+      let kept = ended
+        .cut_at()
+        .filter(|&at| at < written.len() && written.is_char_boundary(at))
+        .map(|at| written[..at].trim())
+        .filter(|kept| !kept.is_empty())
+        .unwrap_or_else(|| written.trim());
       (SmolStr::new(kept), DescriptionEnd::Ragged)
     }
-  }
-
-  /// Words a `.` ends without ending a sentence, compared without case.
-  const ABBREVIATIONS: [&str; 22] = [
-    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "mt", "vs", "etc", "e.g", "i.e", "no",
-    "inc", "ltd", "co", "corp", "dept", "fig", "approx", "u.s",
-  ];
-
-  /// Whether the `.` at byte `at` of `text` ends an abbreviation or an
-  /// initial rather than a sentence: the word before it is one letter
-  /// (`J.`), holds a `.` of its own (`U.S.`), or is a known abbreviation.
-  fn ends_an_abbreviation(text: &str, at: usize) -> bool {
-    let word = text[..at]
-      .rsplit(|c: char| c.is_whitespace() || matches!(c, '(' | '"' | '\'' | '“' | '‘'))
-      .next()
-      .unwrap_or("");
-    word.chars().count() == 1
-      || word.contains('.')
-      || ABBREVIATIONS
-        .iter()
-        .any(|abbreviation| word.eq_ignore_ascii_case(abbreviation))
-  }
-
-  /// Whether byte `at` of `text` stands inside a quotation: an odd number
-  /// of `"` before it, or more opening than closing `“`/`”`, `「`/`」`,
-  /// `『`/`』` before it.
-  fn inside_quotes(text: &str, at: usize) -> bool {
-    let before = &text[..at];
-    let count = |c: char| before.matches(c).count();
-    count('"') % 2 == 1
-      || count('“') > count('”')
-      || count('「') > count('」')
-      || count('『') > count('』')
-  }
-
-  /// Whether the sentence-ending punctuation `c` at byte `at` of `text`
-  /// ends a sentence beyond doubt, given `rest`, the text after it. See
-  /// [`ImageAnalysisTask::with_sentence_cut_back`] for the rule.
-  fn unambiguous_end(text: &str, at: usize, c: char, rest: &str) -> bool {
-    if inside_quotes(text, at) {
-      return false;
-    }
-    match c {
-      '。' | '！' | '？' => true,
-      '.' | '!' | '?' => {
-        let after = rest.trim_start();
-        rest.starts_with(char::is_whitespace)
-          && after.starts_with(char::is_uppercase)
-          && !(c == '.' && ends_an_abbreviation(text, at))
-      }
-      _ => false,
-    }
-  }
-
-  /// Whether `text` ends on an unambiguous sentence end: its last
-  /// character is a `.`, `!` or `?` that ends no abbreviation and stands
-  /// outside quotes, or a full-width `。`, `！` or `？` outside quotes. A
-  /// quotation closing after the punctuation (`…"Stop."`) is not one.
-  fn ends_a_sentence(text: &str) -> bool {
-    let Some((at, c)) = text.char_indices().next_back() else {
-      return false;
-    };
-    if inside_quotes(text, at) {
-      return false;
-    }
-    match c {
-      '。' | '！' | '？' | '!' | '?' => true,
-      '.' => !ends_an_abbreviation(text, at),
-      _ => false,
-    }
-  }
-
-  /// The byte offset just past `text`'s last unambiguous sentence end, or
-  /// `None` when it has none.
-  fn last_sentence_end(text: &str) -> Option<usize> {
-    text
-      .char_indices()
-      .filter(|&(at, c)| {
-        let after = at + c.len_utf8();
-        unambiguous_end(text, at, c, &text[after..])
-      })
-      .map(|(at, c)| at + c.len_utf8())
-      .next_back()
   }
 
   impl Default for ImageAnalysisTask {
@@ -1602,7 +1521,8 @@ Rules:
         match field {
           Field::Scene => result.set_scene(value.into_label()),
           Field::Description => {
-            let (description, end) = self.settle_description(&value.into_string(), description_end);
+            let (description, end) =
+              Self::settle_description(&value.into_string(), description_end);
             result.set_description(description).set_description_end(end)
           }
           Field::Subjects => result.set_subjects(value.into_labels()),
@@ -3945,7 +3865,7 @@ Rules:
 
     /// The issue's two captions, the reviews' counter-examples, and the
     /// shapes the rules below turn on — each at its own cap.
-    const AT_THE_CAP: [&str; 9] = [
+    const AT_THE_CAP: [&str; 12] = [
       "A person wearing a white t-shirt with 'PLAYFUL OF CLASSIC' printed on it stands indoors, facing forward with a neutral,略",
       "A dimly lit room features a wooden chair with a white cushion, a small wooden desk with drawers, and a patterned rug on木",
       "A wooden sign is printed with 愛",
@@ -3955,7 +3875,16 @@ Rules:
       "A cat sleeps on a rug\u{FFFD}",
       "Two people talk across a desk. A lamp glows on a shelf behind",
       "台所で二人が話している。窓の外は雨が降っていて、壁の時計は",
+      "Two people talk across a desk.",
+      "A portrait of Capt.",
+      "A sign reads 'STOP! LOOK BOTH WAYS'",
     ];
+
+    /// The byte offset where `written`'s last character begins — the
+    /// boundary an engine names when it reports that token cut.
+    fn last_char(written: &str) -> usize {
+      written.char_indices().next_back().map_or(0, |(at, _)| at)
+    }
 
     /// LAW (Codex R1): without the decoder's account nothing is deleted
     /// or inferred. Text cannot tell a string the grammar closed at the cap
@@ -3974,99 +3903,88 @@ Rules:
     }
 
     /// LAW: a description the model ended is `Whole` whatever its length —
-    /// at the cap included — and kept as written.
+    /// at the cap included — and kept as written; a cut boundary means
+    /// nothing beside the model's own end.
     #[test]
     fn a_description_the_model_ended_is_whole_at_any_length() {
       for written in AT_THE_CAP {
-        assert_eq!(
-          settled(&capped_at(written), written, Some(FieldEnd::MODEL)),
-          (written.into(), crate::DescriptionEnd::Whole),
-          "{written}"
-        );
+        for end in [
+          FieldEnd::MODEL,
+          FieldEnd::MODEL.with_cut_at(last_char(written)),
+        ] {
+          assert_eq!(
+            settled(&capped_at(written), written, Some(end)),
+            (written.into(), crate::DescriptionEnd::Whole),
+            "{written} under {end:?}"
+          );
+        }
       }
     }
 
-    /// LAW (application#235): a description the grammar closed at the cap
-    /// mid-sentence lands `Ragged`, kept whole: the issue's captions keep
-    /// their last token — a whole token, not a cut one — and the caption
-    /// says it is cut. Only a last token the decoder reports cut loses its
-    /// U+FFFD; nothing goes for its script.
+    /// LAW (Codex R2, the authority's order): a description the grammar
+    /// closed at the cap is `Ragged` and kept as written — on a sentence
+    /// end or not, CJK letter or not. Only the decoder can say whether a
+    /// cap stopped it, and nothing in the text is taken for an ending.
     #[test]
-    fn a_description_closed_at_the_cap_is_ragged_and_kept_whole() {
-      for written in &AT_THE_CAP[..7] {
+    fn a_description_closed_at_the_cap_is_ragged_and_kept_as_written() {
+      for written in AT_THE_CAP {
         assert_eq!(
           settled(&capped_at(written), written, Some(FieldEnd::CAP)),
-          ((*written).into(), crate::DescriptionEnd::Ragged),
+          (written.into(), crate::DescriptionEnd::Ragged),
           "{written}"
         );
       }
-      let written = "A cat sleeps on a rug\u{FFFD}";
-      assert_eq!(
-        settled(
-          &capped_at(written),
-          written,
-          Some(FieldEnd::CAP.with_last_token_cut(true))
-        ),
-        (
-          "A cat sleeps on a rug".into(),
-          crate::DescriptionEnd::Ragged
-        )
-      );
-      let written = "Two people talk across a desk.";
-      assert_eq!(
-        settled(&capped_at(written), written, Some(FieldEnd::CAP)),
-        (written.into(), crate::DescriptionEnd::Sentence),
-        "closed at the cap on a sentence end"
-      );
     }
 
-    /// LAW (Codex R1): the cut-back is off by default, and when on it cuts
-    /// only at an unambiguous sentence end — never after an abbreviation or
-    /// an initial, never at punctuation inside or closing a quotation —
-    /// and keeps the description whole and `Ragged` otherwise.
+    /// LAW (Codex R2, [high]): **the reviews' fixtures are kept and marked.**
+    /// An abbreviation the allow-list did not hold (`Capt.`) and a
+    /// single-quoted shout (`'STOP! LOOK BOTH WAYS'`) are not sentence ends
+    /// the parser may cut at or call complete: closed at the cap they are
+    /// kept as written and `Ragged`, the text continuing past them kept too.
     #[test]
-    fn the_cut_back_is_off_by_default_and_cuts_only_at_an_unambiguous_end() {
-      let two = AT_THE_CAP[7];
-      assert_eq!(
-        settled(&capped_at(two), two, Some(FieldEnd::CAP)),
-        (two.into(), crate::DescriptionEnd::Ragged),
-        "off by default"
-      );
-
-      let cutting = |written: &str| {
-        settled(
-          &capped_at(written).with_sentence_cut_back(true),
-          written,
-          Some(FieldEnd::CAP),
-        )
-      };
-      assert_eq!(
-        cutting(two),
-        (
-          "Two people talk across a desk.".into(),
-          crate::DescriptionEnd::Sentence
-        )
-      );
-      assert_eq!(
-        cutting(AT_THE_CAP[8]),
-        (
-          "台所で二人が話している。".into(),
-          crate::DescriptionEnd::Sentence
-        )
-      );
-      for ambiguous in [
-        AT_THE_CAP[3],
-        AT_THE_CAP[4],
-        AT_THE_CAP[5],
-        "A sign reads \"OPEN TODAY!\" A man waits by the door of the shop",
-        "A poster says “Stop. Look.” beside a crossing in the town",
-        "店の看板に「休み。また明日」と書いてあり、通りは静か",
-        "Two people talk. a lamp glows on a shelf behind them all",
+    fn the_reviews_fixtures_are_kept_as_written_and_marked_ragged() {
+      for written in [
+        "A portrait of Capt.",
+        "A portrait of Capt. Morgan standing nearby",
+        "A sign reads 'STOP! LOOK BOTH WAYS' beside the road",
+        "A sign reads 'STOP!",
       ] {
         assert_eq!(
-          cutting(ambiguous),
-          (ambiguous.into(), crate::DescriptionEnd::Ragged),
-          "{ambiguous}"
+          settled(&capped_at(written), written, Some(FieldEnd::CAP)),
+          (written.into(), crate::DescriptionEnd::Ragged),
+          "{written}"
+        );
+      }
+    }
+
+    /// LAW (Codex R2, [medium]): **only a suffix the decoder names by its
+    /// boundary is removed**, and only where that boundary falls inside the
+    /// text on a character boundary and leaves text before it. Every
+    /// trailing U+FFFD is not a cut token: with no boundary, nothing goes.
+    #[test]
+    fn only_a_suffix_the_decoder_names_is_removed() {
+      let written = "A cat sleeps on a rug\u{FFFD}\u{FFFD}";
+      let task = capped_at(written);
+      let named = written.len() - '\u{FFFD}'.len_utf8();
+      assert_eq!(
+        settled(&task, written, Some(FieldEnd::CAP.with_cut_at(named))),
+        (
+          "A cat sleeps on a rug\u{FFFD}".into(),
+          crate::DescriptionEnd::Ragged
+        ),
+        "exactly the named token's bytes go"
+      );
+      for (end, why) in [
+        (FieldEnd::CAP, "no boundary named"),
+        (FieldEnd::CAP.with_cut_at(named + 1), "inside a character"),
+        (FieldEnd::CAP.with_cut_at(written.len()), "at the end"),
+        (FieldEnd::CAP.with_cut_at(written.len() + 4), "past the end"),
+        (FieldEnd::CAP.with_cut_at(0), "nothing left before it"),
+      ] {
+        assert_eq!(
+          settled(&task, written, Some(end)),
+          (written.into(), crate::DescriptionEnd::Ragged),
+          "{why}"
         );
       }
     }
@@ -4076,20 +3994,17 @@ Rules:
     /// without one is kept as it stands.
     #[test]
     fn settling_is_idempotent() {
-      let cutting = ImageAnalysisTask::new().with_sentence_cut_back(true);
       for written in AT_THE_CAP {
         for end in [
           FieldEnd::MODEL,
           FieldEnd::CAP,
-          FieldEnd::CAP.with_last_token_cut(true),
+          FieldEnd::CAP.with_cut_at(last_char(written)),
         ] {
-          for task in [capped_at(written), cutting.clone()] {
-            let task = task.with_description_max_chars(nz(written.chars().count()));
-            let once = settled(&task, written, Some(end));
-            let twice = settled(&task, &once.0, Some(end));
-            assert_eq!(twice, once, "{written} under {end:?}");
-            assert_eq!(settled(&task, &once.0, None).0, once.0, "{written}");
-          }
+          let task = capped_at(written);
+          let once = settled(&task, written, Some(end));
+          let twice = settled(&task, &once.0, Some(end));
+          assert_eq!(twice, once, "{written} under {end:?}");
+          assert_eq!(settled(&task, &once.0, None).0, once.0, "{written}");
         }
       }
     }

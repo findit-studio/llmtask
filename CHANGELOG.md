@@ -3,32 +3,30 @@
 ## [Unreleased]
 
 ### Added
-- `DescriptionEnd` (`Unknown`, the default; `Whole`; `Sentence`; `Ragged`;
+- `DescriptionEnd` (`Unknown`, the default; `Whole`; `Ragged`;
   `#[non_exhaustive]`) and `ImageAnalysis::description_end` with its
   `with_` / `set_` pair: how the description ends. The `serde` shape gains
   the `description_end` key (snake-case names), read as `unknown` when a
-  document has none.
+  document has none. `with_description` / `set_description` reset it to
+  `Unknown` — clearing included — since the old text's ending says
+  nothing about the new one; a caller with the decoder's account sets it
+  afterwards.
 - `image_analysis::FieldEnd` (`FieldEnd::MODEL`, `FieldEnd::CAP`,
-  `with_last_token_cut`) and `ImageAnalysisTask::parse_with_description_end`
+  `with_cut_at`) and `ImageAnalysisTask::parse_with_description_end`
   (findit-studio/application#235). A constrained decoder ends the
   description at the schema's `maxLength` wherever the sentence had got to,
   and only the decoder knows whether it closed the string there or the
   model did: an answer that ends exactly at the cap reads the same either
   way. `FieldEnd` is the decoder's account — whether the grammar closed the
-  string at the cap, and whether its last token's bytes were cut — and
-  `parse_with_description_end` settles the description by it. The model's
-  own end is `Whole` at any length. A string the grammar closed at the cap
-  loses the trailing U+FFFD of a last token the decoder reports it cut, is
-  `Sentence` when it then ends on an unambiguous sentence end, and is
-  otherwise kept whole and marked `Ragged`, never emptied. Settling is
+  string at the cap, and, when the string's last token was cut, the byte
+  offset where that token's text begins — and `parse_with_description_end`
+  settles the description by it: the model's own end is `Whole` at any
+  length; a string closed at the cap is `Ragged`, kept as written less only
+  the suffix from the named boundary on (when it falls inside the text on a
+  character boundary and leaves text before it). The parser never cuts a
+  description back to a sentence end; whether a ragged one holds whole
+  sentences is a consumer's reading of the marked text. Settling is
   idempotent.
-- `ImageAnalysisTask::sentence_cut_back` with its `with_` / `set_` pair,
-  off by default: with it on, a description the grammar closed at the cap
-  mid-sentence is cut back to its last unambiguous sentence end and marked
-  `Sentence`. A `.`, `!` or `?` qualifies only outside quotes, followed by
-  whitespace and a capital letter, and, for a `.`, not ending an
-  abbreviation (`Dr.`, `e.g.`) or an initial (`J.`); a `。`, `！` or `？`
-  qualifies outside quotes.
 
 `Task::parse` is unchanged: it has the answer's text alone, so it keeps
 the description as written and marks it `DescriptionEnd::Unknown`. A

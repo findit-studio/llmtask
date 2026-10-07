@@ -196,6 +196,23 @@ mod json {
     /// JSON parsed and had no missing fields, but every value was empty.
     #[error("structured response had no usable fields")]
     NoUsableFields,
+    /// A constrained decoder's account says the grammar closed the
+    /// description at its `maxLength`, but the description it describes
+    /// does not hold exactly as many characters as this task's cap: the
+    /// account was taken under another cap. A configuration skew between
+    /// the engine and the task, refused rather than settled — see
+    /// `image_analysis::FieldEnd`.
+    #[error(
+      "the decoder's account says the grammar closed the description at {chars} characters, \
+       but this task's cap is {cap}"
+    )]
+    DescriptionCapMismatch {
+      /// This task's `description_max_chars`.
+      cap: usize,
+      /// The characters (Unicode scalar values) of the description the
+      /// account describes.
+      chars: usize,
+    },
   }
 }
 

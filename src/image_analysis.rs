@@ -48,6 +48,14 @@ use std::vec::Vec;
 /// A field the producing task did not ask for reads empty: the canonical
 /// `ImageAnalysisTask` asks for `description` and `tags` by default, and
 /// for each other field only when that field's extension is switched on.
+///
+/// With the `serde` feature the fields serialize in the order declared,
+/// [`description_end`](Self::description_end) last, after the ten fields
+/// 0.4.x wrote. A self-describing document written before it existed (JSON
+/// from 0.4.x) reads it as [`DescriptionEnd::Unknown`], the honest value
+/// for a description no decoder's account settled. A positional format
+/// (bincode) cannot tell an absent field from a present one, so a 0.4.x
+/// payload in one does not read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageAnalysis {
@@ -61,6 +69,9 @@ pub struct ImageAnalysis {
   lighting: Vec<SmolStr>,
   tags: Vec<SmolStr>,
   categories: Vec<SmolStr>,
+  // Last, so the ten fields 0.4.x wrote keep their places.
+  #[cfg_attr(feature = "serde", serde(default))]
+  description_end: DescriptionEnd,
 }
 
 impl ImageAnalysis {
@@ -106,16 +117,49 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `description`. Pass an empty string to clear.
+  ///
+  /// Resets [`description_end`](Self::description_end) to
+  /// [`DescriptionEnd::Unknown`], as [`Self::set_description`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_description(mut self, val: impl Into<SmolStr>) -> Self {
-    self.description = val.into();
+    self.set_description(val);
     self
   }
 
   /// In-place setter for `description`. Pass an empty string to clear.
+  ///
+  /// Resets [`description_end`](Self::description_end) to
+  /// [`DescriptionEnd::Unknown`]: how the old text ended says nothing about
+  /// the new one, so a caller holding the decoder's account of the new
+  /// text sets it afterwards.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_description(&mut self, val: impl Into<SmolStr>) -> &mut Self {
     self.description = val.into();
+    self.description_end = DescriptionEnd::Unknown;
+    self
+  }
+
+  // --- description_end ---
+
+  /// How the description ends: where its writer ended it, or ragged where
+  /// a length cap stopped it — or unknown. See [`DescriptionEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn description_end(&self) -> DescriptionEnd {
+    self.description_end
+  }
+
+  /// Builder-style setter for `description_end`. Set it after the
+  /// description: setting the description resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_description_end(mut self, val: DescriptionEnd) -> Self {
+    self.description_end = val;
+    self
+  }
+
+  /// In-place setter for `description_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_description_end(&mut self, val: DescriptionEnd) -> &mut Self {
+    self.description_end = val;
     self
   }
 
@@ -298,6 +342,40 @@ impl ImageAnalysis {
   }
 }
 
+/// How an [`ImageAnalysis`]'s description ends.
+///
+/// A task that caps the description's length — the canonical
+/// `ImageAnalysisTask` states its cap as the schema's `maxLength` — has
+/// it closed by a constrained decoder at the cap, wherever the sentence
+/// had got to (findit-studio/application#235:
+/// `…facing forward with a neutral,略`). Only the decoder knows whether it
+/// closed a string or the model did: an answer that ends exactly at the
+/// cap reads the same either way. So this fact comes from the engine's
+/// account ([`FieldEnd`], handed to
+/// `ImageAnalysisTask::parse_with_description_end`), and without one it
+/// is [`Unknown`](Self::Unknown) and the text is kept as written.
+///
+/// The parser never cuts a description back: whether a ragged one still
+/// holds whole sentences is a reading of its text, a consumer's choice to
+/// make over the marked text, never the parser's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum DescriptionEnd {
+  /// Nothing says how the description ended: it was parsed without the
+  /// decoder's account (`Task::parse`), or built by hand. The default; the
+  /// text is as the answer wrote it.
+  #[default]
+  Unknown,
+  /// The model ended the description itself, whatever its length.
+  Whole,
+  /// The grammar closed the description at the cap: it ends where the cap
+  /// stopped it, kept as written — less only the bytes of a last token the
+  /// decoder names as cut ([`FieldEnd::with_cut`]).
+  Ragged,
+}
+
 // Tests run under both std (default) and `--no-default-features
 // --features alloc`: `vec!` / `format!` are alloc macros, not
 // std-only — bring them into scope explicitly so the std prelude
@@ -332,6 +410,81 @@ mod tests {
     assert_eq!(s.categories().len(), 1);
   }
 
+  /// LAW (Codex R2, [medium]): **setting or clearing the description
+  /// resets how it ends.** The mark describes the text it was settled
+  /// with; a new text — or none — is `Unknown` until a caller with the
+  /// decoder's account sets it again.
+  #[test]
+  fn the_description_mutators_reset_how_it_ends() {
+    let ragged = ImageAnalysis::new()
+      .with_description("A cat sleeps on a")
+      .with_description_end(DescriptionEnd::Ragged);
+    assert_eq!(ragged.description_end(), DescriptionEnd::Ragged);
+    assert_eq!(
+      ragged
+        .clone()
+        .with_description("A cat sleeps on a rug.")
+        .description_end(),
+      DescriptionEnd::Unknown
+    );
+    let mut set = ragged.clone();
+    set.set_description("A cat sleeps.");
+    assert_eq!(set.description_end(), DescriptionEnd::Unknown);
+    let mut cleared = ragged;
+    cleared.set_description("");
+    assert_eq!(cleared.description_end(), DescriptionEnd::Unknown);
+    assert_eq!(
+      cleared
+        .with_description("A cat.")
+        .with_description_end(DescriptionEnd::Whole)
+        .description_end(),
+      DescriptionEnd::Whole,
+      "set after the text, the mark stands"
+    );
+  }
+
+  /// LAW (Codex R4, [high]): **a document 0.4.1 wrote reads, its end
+  /// unknown.** The JSON below is the shape 0.4.1 serializes, its ten keys
+  /// in their order and no `description_end`: it reads every field as
+  /// written and the mark as [`DescriptionEnd::Unknown`].
+  #[cfg(all(feature = "serde", feature = "json"))]
+  #[test]
+  fn a_document_0_4_1_wrote_reads_with_its_end_unknown() {
+    let written_by_0_4_1 = r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":["rug"],"actions":["sleeping"],"emotion":["calm"],"shot_type":"wide","lighting":["soft"],"tags":["cat","rug"],"categories":["animal"]}"#;
+    let read: ImageAnalysis =
+      serde_json::from_str(written_by_0_4_1).expect("a 0.4.1 document reads");
+    assert_eq!(read.description_end(), DescriptionEnd::Unknown);
+    assert_eq!(read.description(), "A cat sleeps on a");
+    assert_eq!(read.scene(), "kitchen");
+    assert_eq!(read.subjects(), ["cat"]);
+    assert_eq!(read.shot_type(), "wide");
+    assert_eq!(read.categories(), ["animal"]);
+  }
+
+  /// LAW (Codex R4, [high]): **the mark is written last, after the ten
+  /// fields in the places 0.4.x wrote them, and round-trips by its
+  /// snake-case name.** A positional format reads fields by place, so the
+  /// mark between `description` and `subjects` would present a 0.4.x
+  /// payload's `subjects` where the mark is read; the order is asserted on
+  /// the JSON written, key for key.
+  #[cfg(all(feature = "serde", feature = "json"))]
+  #[test]
+  fn the_description_end_is_written_last_and_round_trips() {
+    let ragged = ImageAnalysis::new()
+      .with_scene("kitchen")
+      .with_description("A cat sleeps on a")
+      .with_description_end(DescriptionEnd::Ragged)
+      .with_subjects(vec!["cat".into()])
+      .with_tags(vec!["cat".into(), "rug".into()]);
+    let written = serde_json::to_string(&ragged).expect("an analysis serializes");
+    assert_eq!(
+      written,
+      r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":[],"actions":[],"emotion":[],"shot_type":"","lighting":[],"tags":["cat","rug"],"categories":[],"description_end":"ragged"}"#
+    );
+    let read: ImageAnalysis = serde_json::from_str(&written).expect("it reads back");
+    assert_eq!(read, ragged);
+  }
+
   #[test]
   fn set_in_place() {
     let mut s = ImageAnalysis::new();
@@ -348,7 +501,7 @@ mod tests {
 
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-pub use image_analysis_task::{Extension, ImageAnalysisTask, UnknownExtension};
+pub use image_analysis_task::{Extension, FieldEnd, ImageAnalysisTask, UnknownExtension};
 
 /// The `ImageAnalysisTask` implementation. Grouped in its own private
 /// module (mirroring `task::json`'s pattern) so the whole surface —
@@ -372,7 +525,7 @@ mod image_analysis_task {
   // lib.rs).
   use std::{collections::BTreeMap, string::String, vec::Vec};
 
-  use super::ImageAnalysis;
+  use super::{DescriptionEnd, ImageAnalysis};
   use crate::{
     grammar::Grammar,
     task::{JsonParseError, Task},
@@ -877,7 +1030,9 @@ Rules:
     /// The most characters `description` may hold, counted in Unicode
     /// scalar values (what JSON Schema's `maxLength` counts). Stated in the
     /// schema as `maxLength` and in the prompt; `parse` refuses a longer
-    /// description by name.
+    /// description by name, and settles the end of one that reached the cap
+    /// — where a constrained decoder closed it — recording what it did as
+    /// the analysis's [`DescriptionEnd`](crate::DescriptionEnd).
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn description_max_chars(&self) -> NonZeroUsize {
       self.description_max_chars
@@ -973,6 +1128,162 @@ Rules:
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn set_accept_empty(&mut self, val: bool) -> &mut Self {
       self.accept_empty = val;
+      self
+    }
+
+    // --- parsing with the decoder's account ---
+
+    /// [`Task::parse`], with the constrained decoder's account of how it
+    /// ended the description: whether the grammar closed it at the
+    /// field's `maxLength`, and the text of a last token it names as cut.
+    ///
+    /// `Task::parse` has the answer's text alone, and text cannot tell a
+    /// string the grammar closed at the cap from one the model ended at
+    /// exactly that length — so it keeps the description as written and
+    /// marks it [`DescriptionEnd::Unknown`]. With `end`, an account of one
+    /// string ([`FieldEnd::source`]):
+    ///
+    /// - a description that is not exactly that string is not one the
+    ///   account describes: kept as written, [`DescriptionEnd::Unknown`];
+    /// - the model ended it: kept as written, [`DescriptionEnd::Whole`],
+    ///   whatever its length;
+    /// - the grammar closed it at the cap: it holds exactly the task's
+    ///   `description_max_chars` in characters, or the account was taken
+    ///   under another cap and is refused by name; kept as written,
+    ///   [`DescriptionEnd::Ragged`] — less exactly the bytes
+    ///   [`FieldEnd::cut`] names, the text of a last token the decoder
+    ///   reports cut, when the description ends with those bytes and leaves
+    ///   text before them.
+    ///
+    /// That suffix is the one change a parse may make to a description's
+    /// text. Nothing is removed for its script, its punctuation or its
+    /// length, and nothing is cut back to a sentence end: whether a ragged
+    /// description holds whole sentences is a consumer's reading of the
+    /// marked text.
+    ///
+    /// Settling is idempotent on the TEXT: a settled description parsed
+    /// again with the same account settles to the same text. Its mark stays
+    /// where the settled text is still the account's string — nothing was
+    /// removed or trimmed — and is [`DescriptionEnd::Unknown`] where it is
+    /// not: the account is not about the settled string.
+    ///
+    /// # Errors
+    ///
+    /// As [`Task::parse`]; and [`JsonParseError::DescriptionCapMismatch`]
+    /// when `end` is a cap's account of the description whose characters
+    /// are not this task's cap.
+    pub fn parse_with_description_end(
+      &self,
+      raw: &str,
+      end: &FieldEnd,
+    ) -> Result<ImageAnalysis, JsonParseError> {
+      self.parse_ended(raw, Some(end))
+    }
+  }
+
+  /// How a constrained decoder ended one string field of an answer — the
+  /// account [`ImageAnalysisTask::parse_with_description_end`] settles the
+  /// description by. An engine that decodes under the task's grammar
+  /// knows it at the step it closes the string; the answer's text does
+  /// not carry it.
+  ///
+  /// # One string
+  ///
+  /// Every account is about ONE string: the field exactly as the answer
+  /// carries it — JSON-decoded, untrimmed — which it holds whole
+  /// ([`Self::source`]) and is bound to byte for byte. A description that is
+  /// not exactly that string is not one the account describes, and nothing
+  /// is known about how it ends: nothing is removed from it, and it is
+  /// [`DescriptionEnd::Unknown`] — a settled description, shorter by a
+  /// suffix or by its trimming; another description of the same length; an
+  /// account left from a retry, or taken for another answer in a batch.
+  ///
+  /// # What an engine reports
+  ///
+  /// Whether the model closed the string ([`Self::model`]) or the grammar
+  /// closed it at its `maxLength` ([`Self::cap`]); and, when the string's
+  /// last token was cut — its bytes an incomplete sequence the detokenizer
+  /// decoded as U+FFFD — that token's text ([`Self::with_cut`]). The account
+  /// names the suffix by its BYTES, never by a position: a position moves
+  /// when the text is trimmed. A flag saying only *that* a token was cut is
+  /// not an account of which bytes: with none, nothing is removed.
+  ///
+  /// # A cap's invariant
+  ///
+  /// The grammar closes a string exactly at its cap, so the string a cap's
+  /// account describes holds exactly as many characters (Unicode scalar
+  /// values, as the schema counts them) as the task's
+  /// `description_max_chars`. One that does not was taken under another cap:
+  /// the account and the task disagree, a configuration skew that is
+  /// refused by name ([`JsonParseError::DescriptionCapMismatch`]) rather
+  /// than settled.
+  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+  pub struct FieldEnd {
+    closed_at_cap: bool,
+    source: SmolStr,
+    cut: Option<SmolStr>,
+  }
+
+  impl FieldEnd {
+    /// The model closed `field` itself: the grammar would have let it go
+    /// on. `field` is the string exactly as the answer carries it —
+    /// JSON-decoded, untrimmed.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn model(field: &str) -> Self {
+      Self {
+        closed_at_cap: false,
+        source: SmolStr::new(field),
+        cut: None,
+      }
+    }
+
+    /// The grammar closed `field` at its `maxLength`: the model was left no
+    /// choice but to end it there. `field` is the string exactly as the
+    /// answer carries it — JSON-decoded, untrimmed — and holds exactly the
+    /// cap's characters; only a capped string carries this account.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn cap(field: &str) -> Self {
+      Self {
+        closed_at_cap: true,
+        source: SmolStr::new(field),
+        cut: None,
+      }
+    }
+
+    /// Whether the grammar closed the string at the field's `maxLength`.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn closed_at_cap(&self) -> bool {
+      self.closed_at_cap
+    }
+
+    /// The one string this account describes, exactly as the answer
+    /// carries it.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn source(&self) -> &str {
+      &self.source
+    }
+
+    /// The cut last token's text, when the decoder named one — see
+    /// [`Self::with_cut`].
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn cut(&self) -> Option<&str> {
+      self.cut.as_deref()
+    }
+
+    /// Builder-style setter for [`Self::cut`]: the last token of the
+    /// account's string was cut, and `suffix` is its text, exactly as the
+    /// string ends with it — the detokenizer's U+FFFD included.
+    ///
+    /// A description that is the account's string, closed at the cap, loses
+    /// exactly those bytes, and only when it ends with them and keeps text
+    /// before them; anything else (a suffix the text does not end with, an
+    /// empty one, one that is the whole text) removes nothing and keeps the
+    /// trimmed text. Only the grammar's close cuts a token, so a
+    /// [`Self::model`] account ignores it.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
+    pub fn with_cut(mut self, suffix: &str) -> Self {
+      self.cut = Some(SmolStr::new(suffix));
       self
     }
   }
@@ -1178,6 +1489,42 @@ Rules:
         _ => false,
       }
     }
+
+    /// `written`, the description as the answer wrote it, as
+    /// [`ImageAnalysis`] holds it, and how it ends ([`DescriptionEnd`]),
+    /// settled by the decoder's account `ended` — see
+    /// [`Self::parse_with_description_end`]. The text is kept as written,
+    /// trimmed as every parse trims it, except for the one suffix a cap's
+    /// account names by its bytes: nothing is inferred from the text's
+    /// length, its script or its punctuation.
+    fn settle_description(
+      &self,
+      written: &str,
+      ended: Option<&FieldEnd>,
+    ) -> Result<(SmolStr, DescriptionEnd), JsonParseError> {
+      // An account settles the one string it holds, byte for byte; about any
+      // other text it says nothing.
+      let Some(ended) = ended.filter(|ended| written == ended.source()) else {
+        return Ok((SmolStr::new(written.trim()), DescriptionEnd::Unknown));
+      };
+      if !ended.closed_at_cap() {
+        return Ok((SmolStr::new(written.trim()), DescriptionEnd::Whole));
+      }
+      // The grammar closes a string exactly at the cap: a cap's account of
+      // a string of another length was taken under another cap.
+      let (cap, chars) = (self.description_max_chars.get(), written.chars().count());
+      if chars != cap {
+        return Err(JsonParseError::DescriptionCapMismatch { cap, chars });
+      }
+      let kept = ended
+        .cut()
+        .filter(|suffix| !suffix.is_empty())
+        .and_then(|suffix| written.strip_suffix(suffix))
+        .map(str::trim)
+        .filter(|kept| !kept.is_empty())
+        .unwrap_or_else(|| written.trim());
+      Ok((SmolStr::new(kept), DescriptionEnd::Ragged))
+    }
   }
 
   impl Default for ImageAnalysisTask {
@@ -1206,6 +1553,18 @@ Rules:
     }
 
     fn parse(&self, raw: &str) -> Result<Self::Output, JsonParseError> {
+      self.parse_ended(raw, None)
+    }
+  }
+
+  impl ImageAnalysisTask {
+    /// [`Task::parse`]'s body, with the decoder's account of how it ended
+    /// the description when there is one.
+    fn parse_ended(
+      &self,
+      raw: &str,
+      description_end: Option<&FieldEnd>,
+    ) -> Result<ImageAnalysis, JsonParseError> {
       // Not a plain `serde_json::from_str` into a `Value` (see
       // `parse_members`'s doc comment): that collapses a duplicate
       // top-level member — later overwrites earlier — before any check
@@ -1253,7 +1612,11 @@ Rules:
       for (field, value) in values {
         match field {
           Field::Scene => result.set_scene(value.into_label()),
-          Field::Description => result.set_description(value.into_label()),
+          Field::Description => {
+            let (description, end) =
+              self.settle_description(&value.into_string(), description_end)?;
+            result.set_description(description).set_description_end(end)
+          }
           Field::Subjects => result.set_subjects(value.into_labels()),
           Field::Objects => result.set_objects(value.into_labels()),
           Field::Actions => result.set_actions(value.into_labels()),
@@ -1474,6 +1837,16 @@ Rules:
   }
 
   impl FieldValue {
+    /// A string field's value as the answer wrote it, untrimmed. `parse`
+    /// asks this only of a string field's value, so the empty string for
+    /// an array is never reached.
+    fn into_string(self) -> String {
+      match self {
+        Self::String(string) => string,
+        Self::Strings(_) => String::new(),
+      }
+    }
+
     /// A string field's value as [`ImageAnalysis`] holds it: the string,
     /// trimmed. `parse` asks this only of a string field's value, so the
     /// empty label for an array is never reached.
@@ -2986,7 +3359,9 @@ Rules:
     }
 
     /// An answer over a cap is refused by name, as a missing field is,
-    /// and an answer at a cap parses whole: `parse` never truncates.
+    /// and an answer at a cap parses whole: `parse` never truncates an
+    /// answer to fit a cap, and without the decoder's account it does not
+    /// know how the answer ended.
     /// `description` is counted in characters, not bytes, and as the answer
     /// wrote it; `tags` in the elements of its array.
     #[test]
@@ -3004,6 +3379,7 @@ Rules:
         .parse(&format!(r#"{{"description":"{at_cap}","tags":["a"]}}"#))
         .expect("a description of ten two-byte characters is at the cap");
       assert_eq!(analysis.description(), at_cap);
+      assert_eq!(analysis.description_end(), crate::DescriptionEnd::Unknown);
       let over_cap = "é".repeat(11);
       assert_eq!(
         refusal(&format!(r#"{{"description":"{over_cap}","tags":["a"]}}"#)),
@@ -3550,6 +3926,377 @@ Rules:
         if let Some(escape) = found {
           assert_eq!(literal.as_bytes()[escape], b'\\', "{literal}: {escape}");
         }
+      }
+    }
+
+    // ===== a description the decoder closed at the cap (application#235) =====
+
+    /// The description `task` settles from `written`, and how it ends —
+    /// through `Task::parse` when `end` is `None`, else through
+    /// `parse_with_description_end`.
+    fn settled(
+      task: &ImageAnalysisTask,
+      written: &str,
+      end: Option<FieldEnd>,
+    ) -> (String, crate::DescriptionEnd) {
+      parsed(task, written, end).unwrap_or_else(|e| panic!("{written:?} must parse: {e:?}"))
+    }
+
+    /// [`settled`], with the parse's refusal kept.
+    fn parsed(
+      task: &ImageAnalysisTask,
+      written: &str,
+      end: Option<FieldEnd>,
+    ) -> Result<(String, crate::DescriptionEnd), JsonParseError> {
+      let answer =
+        serde_json::to_string(&serde_json::json!({ "description": written, "tags": ["label"] }))
+          .expect("a JSON value serializes");
+      let analysis = match end {
+        None => task.parse(&answer),
+        Some(end) => task.parse_with_description_end(&answer, &end),
+      }?;
+      Ok((analysis.description().into(), analysis.description_end()))
+    }
+
+    /// The task whose cap `written` reaches: capped at its length.
+    fn capped_at(written: &str) -> ImageAnalysisTask {
+      ImageAnalysisTask::new().with_description_max_chars(nz(written.chars().count()))
+    }
+
+    /// The issue's two captions, the reviews' counter-examples, and the
+    /// shapes the rules below turn on — each at its own cap.
+    const AT_THE_CAP: [&str; 12] = [
+      "A person wearing a white t-shirt with 'PLAYFUL OF CLASSIC' printed on it stands indoors, facing forward with a neutral,略",
+      "A dimly lit room features a wooden chair with a white cushion, a small wooden desk with drawers, and a patterned rug on木",
+      "A wooden sign is printed with 愛",
+      "A portrait of Dr. Smith standing beside a desk in a quiet office",
+      "A screen asks \"Ready?\" while runners wait at the line",
+      "J. R. R. Tolkien's books stand on a shelf beside a lamp",
+      "A cat sleeps on a rug\u{FFFD}",
+      "Two people talk across a desk. A lamp glows on a shelf behind",
+      "台所で二人が話している。窓の外は雨が降っていて、壁の時計は",
+      "Two people talk across a desk.",
+      "A portrait of Capt.",
+      "A sign reads 'STOP! LOOK BOTH WAYS'",
+    ];
+
+    /// `written`'s last character, as the text an engine names when it
+    /// reports that token cut.
+    fn last_char(written: &str) -> &str {
+      written
+        .char_indices()
+        .next_back()
+        .map_or("", |(at, _)| &written[at..])
+    }
+
+    /// LAW (Codex R1): without the decoder's account nothing is deleted
+    /// or inferred. Text cannot tell a string the grammar closed at the cap
+    /// from one the model ended at exactly that length, a stray from a
+    /// word in another script, or an abbreviation from a sentence end — so
+    /// `Task::parse` keeps every description as written, `Unknown`.
+    #[test]
+    fn parse_without_the_decoders_account_deletes_nothing() {
+      for written in AT_THE_CAP {
+        assert_eq!(
+          settled(&capped_at(written), written, None),
+          (written.into(), crate::DescriptionEnd::Unknown),
+          "{written}"
+        );
+      }
+    }
+
+    /// LAW: a description the model ended is `Whole` whatever its length —
+    /// at the cap included — and kept as written; a cut boundary means
+    /// nothing beside the model's own end.
+    #[test]
+    fn a_description_the_model_ended_is_whole_at_any_length() {
+      for written in AT_THE_CAP {
+        for end in [
+          FieldEnd::model(written),
+          FieldEnd::model(written).with_cut(last_char(written)),
+        ] {
+          assert_eq!(
+            settled(&capped_at(written), written, Some(end.clone())),
+            (written.into(), crate::DescriptionEnd::Whole),
+            "{written} under {end:?}"
+          );
+        }
+      }
+    }
+
+    /// LAW (Codex R2, the authority's order): a description the grammar
+    /// closed at the cap is `Ragged` and kept as written — on a sentence
+    /// end or not, CJK letter or not. Only the decoder can say whether a
+    /// cap stopped it, and nothing in the text is taken for an ending.
+    #[test]
+    fn a_description_closed_at_the_cap_is_ragged_and_kept_as_written() {
+      for written in AT_THE_CAP {
+        assert_eq!(
+          settled(&capped_at(written), written, Some(FieldEnd::cap(written))),
+          (written.into(), crate::DescriptionEnd::Ragged),
+          "{written}"
+        );
+      }
+    }
+
+    /// LAW (Codex R2, [high]): **the reviews' fixtures are kept and marked.**
+    /// An abbreviation the allow-list did not hold (`Capt.`) and a
+    /// single-quoted shout (`'STOP! LOOK BOTH WAYS'`) are not sentence ends
+    /// the parser may cut at or call complete: closed at the cap they are
+    /// kept as written and `Ragged`, the text continuing past them kept too.
+    #[test]
+    fn the_reviews_fixtures_are_kept_as_written_and_marked_ragged() {
+      for written in [
+        "A portrait of Capt.",
+        "A portrait of Capt. Morgan standing nearby",
+        "A sign reads 'STOP! LOOK BOTH WAYS' beside the road",
+        "A sign reads 'STOP!",
+      ] {
+        assert_eq!(
+          settled(&capped_at(written), written, Some(FieldEnd::cap(written))),
+          (written.into(), crate::DescriptionEnd::Ragged),
+          "{written}"
+        );
+      }
+    }
+
+    /// LAW (Codex R2–R3): **only the bytes the decoder names are removed**,
+    /// and only where the description ends with them and keeps text before
+    /// them. Every trailing U+FFFD is not a cut token: with no suffix named,
+    /// nothing goes; a suffix the text does not end with — one whose last
+    /// byte is the text's but whose character is not, the nearest a `&str`
+    /// comes to a cut inside a character — an empty suffix, and a suffix
+    /// that is the whole text all remove nothing.
+    #[test]
+    fn only_a_suffix_the_decoder_names_is_removed() {
+      let written = "A cat sleeps on a rug\u{FFFD}\u{FFFD}";
+      let task = capped_at(written);
+      assert_eq!(
+        settled(
+          &task,
+          written,
+          Some(FieldEnd::cap(written).with_cut("\u{FFFD}"))
+        ),
+        (
+          "A cat sleeps on a rug\u{FFFD}".into(),
+          crate::DescriptionEnd::Ragged
+        ),
+        "exactly the named token's bytes go"
+      );
+      for (end, why) in [
+        (FieldEnd::cap(written), "no suffix named"),
+        (FieldEnd::cap(written).with_cut(""), "an empty suffix"),
+        (
+          FieldEnd::cap(written).with_cut("dog\u{FFFD}"),
+          "a suffix the text does not end with",
+        ),
+        (FieldEnd::cap(written).with_cut(written), "the whole text"),
+      ] {
+        assert_eq!(
+          settled(&task, written, Some(end)),
+          (written.into(), crate::DescriptionEnd::Ragged),
+          "{why}"
+        );
+      }
+      // `é` is C3 A9 and `©` is C2 A9: the text's last byte is the
+      // suffix's, its last character is not.
+      let written = "A café";
+      assert_eq!(
+        settled(
+          &capped_at(written),
+          written,
+          Some(FieldEnd::cap(written).with_cut("\u{A9}"))
+        ),
+        (written.into(), crate::DescriptionEnd::Ragged),
+        "not a cut inside a character"
+      );
+    }
+
+    /// LAW (Codex R5–R6, [medium]): **an account is about one string, byte
+    /// for byte, and says nothing about any other.** A cap's account taken
+    /// for `abc�` (the suffix `�`) removes nothing from `xyz�`, which has its
+    /// length and ends with its suffix — a stale account after a retry, or
+    /// one misassociated in a batch — nor from a description of another
+    /// length or with a leading space, and marks each of them `Unknown`: the
+    /// account does not describe how they end. A model's account of another
+    /// string says nothing either. `abc�` itself, under the cap of four its
+    /// account was taken under, still loses the `�`, `Ragged`.
+    #[test]
+    fn an_account_says_nothing_about_another_string() {
+      let end = FieldEnd::cap("abc\u{FFFD}").with_cut("\u{FFFD}");
+      assert_eq!(end.source(), "abc\u{FFFD}");
+      assert_eq!(end.cut(), Some("\u{FFFD}"));
+      for written in ["xyz\u{FFFD}", "abcd\u{FFFD}", " abc\u{FFFD}"] {
+        for end in [end.clone(), FieldEnd::model("abc\u{FFFD}")] {
+          assert_eq!(
+            settled(&capped_at(written), written, Some(end.clone())),
+            (written.trim().into(), crate::DescriptionEnd::Unknown),
+            "{written:?} is not the string of {end:?}"
+          );
+        }
+      }
+      assert_eq!(
+        settled(&capped_at("abc\u{FFFD}"), "abc\u{FFFD}", Some(end)),
+        ("abc".into(), crate::DescriptionEnd::Ragged),
+        "the account's own string loses the named bytes"
+      );
+    }
+
+    /// LAW (Codex R6, [medium]): **a cap's account taken under another cap is
+    /// refused by name.** The grammar closes a string exactly at the cap, so
+    /// an account of the four-character `abc�` was taken under a cap of four.
+    /// Reused on that very string by a task whose cap is 120 — the cap moved
+    /// — it is refused as `DescriptionCapMismatch`, never settled to `abc`.
+    /// The same account on ` abc�` is about another string, `Unknown`, and
+    /// the settled `abc�` parsed again with it is refused by name in turn:
+    /// the cap skew surfaces, and nothing is ever stripped.
+    #[test]
+    fn a_cap_account_taken_under_another_cap_is_refused_by_name() {
+      let task = ImageAnalysisTask::new();
+      assert_eq!(task.description_max_chars().get(), 120);
+      let end = FieldEnd::cap("abc\u{FFFD}").with_cut("\u{FFFD}");
+      let refused = |written: &str| {
+        matches!(
+          parsed(&task, written, Some(end.clone())),
+          Err(JsonParseError::DescriptionCapMismatch { cap: 120, chars: 4 })
+        )
+      };
+      assert!(refused("abc\u{FFFD}"), "the identical string under cap 120");
+      let first = settled(&task, " abc\u{FFFD}", Some(end.clone()));
+      assert_eq!(
+        first,
+        ("abc\u{FFFD}".into(), crate::DescriptionEnd::Unknown),
+        "the string with a leading space is not the account's"
+      );
+      assert!(
+        refused(&first.0),
+        "parsed again, it is the account's string: refused"
+      );
+    }
+
+    /// LAW (Codex R3, [high]; R6): **a trimmed description re-settles to
+    /// the same text.** The account names the suffix by its bytes, so
+    /// trimming moves nothing it means. The review's cap-7 `" abcdef"`,
+    /// named whole past its leading space, keeps `"abcdef"` — nothing would
+    /// be left before the suffix — and re-settles to `"abcdef"`, where an
+    /// offset read again in trimmed coordinates cut it to `"a"`.
+    /// `"xyz abcdef"` loses `"abcdef"` once and re-settles to `"xyz"`;
+    /// leading whitespace before a cut CJK token settles to its letters and
+    /// stays there; and a suffix repeated before itself (`"xaa"` less `"a"`)
+    /// is removed once. Each settled text is not the string the account was
+    /// taken from, so parsed again it is `Unknown`: the account is not about
+    /// it.
+    #[test]
+    fn a_trimmed_description_resettles_to_itself() {
+      for (written, suffix, once) in [
+        (" abcdef", "abcdef", "abcdef"),
+        ("xyz abcdef", "abcdef", "xyz"),
+        ("  日本語\u{FFFD}", "\u{FFFD}", "日本語"),
+        ("  日本語 ", "語 ", "日本"),
+        // The named bytes repeat before themselves: the account describes the
+        // string it was taken from, and a settled one is not it.
+        ("A rug\u{FFFD}\u{FFFD}", "\u{FFFD}", "A rug\u{FFFD}"),
+        ("xaa", "a", "xa"),
+      ] {
+        let task = capped_at(written);
+        let end = FieldEnd::cap(written).with_cut(suffix);
+        let first = settled(&task, written, Some(end.clone()));
+        assert_eq!(
+          first,
+          (once.into(), crate::DescriptionEnd::Ragged),
+          "{written:?}"
+        );
+        assert_eq!(
+          settled(&task, &first.0, Some(end)),
+          (once.into(), crate::DescriptionEnd::Unknown),
+          "{written:?} re-settles to the same text, about which the account says nothing"
+        );
+      }
+    }
+
+    /// LAW (Codex R1–R6): settling is idempotent on the TEXT — a settled
+    /// description parsed again with the same account settles to the same
+    /// text, and parsed without one is kept as it stands — over the
+    /// fixtures, and as a property over pseudo-random pairs of a text and a
+    /// suffix drawn from spaces, ASCII, CJK and U+FFFD, where the settled
+    /// text is always either the text trimmed or the text less exactly the
+    /// named suffix, trimmed. The mark parsed again is the same where the
+    /// settled text is still the account's string, and `Unknown` where it
+    /// is not (R6). The account is bound to its text byte for byte (R5):
+    /// the same text with one letter swapped for another of its byte length
+    /// settles to itself trimmed under that account, `Unknown`.
+    #[test]
+    fn settling_is_idempotent() {
+      let once_more = |written: &str, end: FieldEnd| {
+        let task = capped_at(written);
+        let once = settled(&task, written, Some(end.clone()));
+        let twice = settled(&task, &once.0, Some(end.clone()));
+        let mark = if once.0 == end.source() {
+          once.1
+        } else {
+          crate::DescriptionEnd::Unknown
+        };
+        assert_eq!(twice, (once.0.clone(), mark), "{written:?} under {end:?}");
+        assert_eq!(settled(&task, &once.0, None).0, once.0, "{written:?}");
+        once
+      };
+      for written in AT_THE_CAP {
+        for end in [
+          FieldEnd::model(written),
+          FieldEnd::cap(written),
+          FieldEnd::cap(written).with_cut(last_char(written)),
+        ] {
+          once_more(written, end);
+        }
+      }
+
+      const PIECES: [&str; 8] = [" ", "a", "b", "日", "本", "\u{FFFD}", "  ", "語"];
+      let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+      let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+      };
+      for _ in 0..2_000 {
+        // Some text the parse holds: a letter somewhere among the pieces.
+        let mut pieces: Vec<&str> = (0..next(8)).map(|_| PIECES[next(PIECES.len())]).collect();
+        let letter = ["a", "b", "日", "本", "語"][next(5)];
+        let at = next(pieces.len() + 1);
+        pieces.insert(at, letter);
+        let text: String = pieces.concat();
+        let suffix: String = (0..next(4)).map(|_| PIECES[next(PIECES.len())]).collect();
+        let (settled, end) = once_more(&text, FieldEnd::cap(&text).with_cut(&suffix));
+        assert_eq!(end, crate::DescriptionEnd::Ragged);
+        let less = text
+          .strip_suffix(suffix.as_str())
+          .filter(|_| !suffix.is_empty())
+          .map(str::trim)
+          .filter(|kept| !kept.is_empty());
+        assert!(
+          settled == text.trim() || less == Some(settled.as_str()),
+          "{text:?} less {suffix:?} settled to {settled:?}"
+        );
+        // Another text of the same byte length: one letter swapped for
+        // another as long.
+        let other = [
+          ("a", "b"),
+          ("b", "a"),
+          ("日", "本"),
+          ("本", "日"),
+          ("語", "日"),
+        ]
+        .into_iter()
+        .find(|(from, _)| text.contains(from))
+        .map(|(from, to)| text.replacen(from, to, 1))
+        .expect("the text holds a letter");
+        assert_eq!(other.len(), text.len());
+        let end = FieldEnd::cap(&text).with_cut(&suffix);
+        assert_eq!(
+          once_more(&other, end),
+          (other.trim().into(), crate::DescriptionEnd::Unknown),
+          "{other:?} under the account of {text:?} less {suffix:?}"
+        );
       }
     }
 

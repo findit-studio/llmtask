@@ -2,6 +2,62 @@
 
 ## [Unreleased]
 
+The next release is 0.5.0: `ImageAnalysis` changes its serialized layout.
+
+### Changed
+- **Breaking:** `ImageAnalysis` gains `description_end` as its last field,
+  defaulting to `Unknown`. With the `serde` feature it is serialized last,
+  after the ten fields in the places 0.4.x wrote them. A self-describing
+  0.4.x payload (JSON) still reads, its end `unknown`; a 0.4.x payload in a
+  positional format (bincode) does not.
+
+### Added
+- `DescriptionEnd` (`Unknown`, the default; `Whole`; `Ragged`;
+  `#[non_exhaustive]`) and `ImageAnalysis::description_end` with its
+  `with_` / `set_` pair: how the description ends. The `serde` shape gains
+  the `description_end` key, last (snake-case names), read as `unknown`
+  when a document has none. `with_description` / `set_description` reset it to
+  `Unknown` — clearing included — since the old text's ending says
+  nothing about the new one; a caller with the decoder's account sets it
+  afterwards.
+- `image_analysis::FieldEnd` (`FieldEnd::model(field)`,
+  `FieldEnd::cap(field)`, `with_cut(suffix)`, `closed_at_cap`, `source`,
+  `cut`) and `ImageAnalysisTask::parse_with_description_end`
+  (findit-studio/application#235). A constrained decoder ends the
+  description at the schema's `maxLength` wherever the sentence had got to,
+  and only the decoder knows whether it closed the string there or the
+  model did: an answer that ends exactly at the cap reads the same either
+  way. `FieldEnd` is the decoder's account of ONE string, the field exactly
+  as the answer carries it, which it holds whole and is bound to byte for
+  byte: whether the model closed it or the grammar closed it at the cap,
+  and, when its last token was cut, that token's text.
+  `parse_with_description_end` settles the description by it:
+  - a description that is not the account's string is kept as written and
+    `Unknown`: the account says nothing about how it ends (an account left
+    from a retry, or misassociated in a batch);
+  - the model's own end is `Whole` at any length;
+  - a cap's account requires the string to hold exactly the task's
+    `description_max_chars` in characters, since the grammar closes a string
+    exactly at the cap; an account taken under another cap is refused by
+    name as `JsonParseError::DescriptionCapMismatch`, never settled;
+  - a string closed at the cap is `Ragged`, kept as written less exactly the
+    named bytes, and only when it ends with them and keeps text before them.
+
+  The account names the suffix by its bytes, never by a position, so
+  trimming moves nothing it means, and settling is idempotent on the text:
+  a settled description parsed again with the same account settles to the
+  same text, its mark `Unknown` once it is no longer the account's string.
+  The parser never cuts a description back to a sentence end; whether a
+  ragged one holds whole sentences is a consumer's reading of the marked
+  text.
+- `JsonParseError::DescriptionCapMismatch { cap, chars }`, the refusal
+  above. `JsonParseError` is not `#[non_exhaustive]`, so a match over it
+  that names every variant needs this arm — breaking, within 0.5.0.
+
+`Task::parse` is unchanged: it has the answer's text alone, so it keeps
+the description as written and marks it `DescriptionEnd::Unknown`. A
+description over the cap is still refused by name.
+
 ## [0.4.1] - 2026-10-01
 
 ### Added

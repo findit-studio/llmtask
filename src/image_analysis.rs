@@ -363,7 +363,7 @@ pub enum DescriptionEnd {
   Whole,
   /// The grammar closed the description at the cap: it ends where the cap
   /// stopped it, kept as written — less only the bytes of a last token the
-  /// decoder names as cut ([`FieldEnd::with_cut_at`]).
+  /// decoder names as cut ([`FieldEnd::with_cut`]).
   Ragged,
 }
 
@@ -1111,7 +1111,7 @@ Rules:
 
     /// [`Task::parse`], with the constrained decoder's account of how it
     /// ended the description: whether the grammar closed it at the
-    /// field's `maxLength`, and where a last token it names as cut begins.
+    /// field's `maxLength`, and the text of a last token it names as cut.
     ///
     /// `Task::parse` has the answer's text alone, and text cannot tell a
     /// string the grammar closed at the cap from one the model ended at
@@ -1121,18 +1121,20 @@ Rules:
     /// - the model ended it: kept as written, [`DescriptionEnd::Whole`],
     ///   whatever its length;
     /// - the grammar closed it at the cap: kept as written,
-    ///   [`DescriptionEnd::Ragged`] — less the suffix from
-    ///   [`FieldEnd::cut_at`] on, the bytes of a last token the decoder
-    ///   names as cut, and only when that boundary falls inside the text
-    ///   on a character boundary and leaves text before it.
+    ///   [`DescriptionEnd::Ragged`] — less exactly the bytes
+    ///   [`FieldEnd::cut`] names, the text of a last token the decoder
+    ///   reports cut, and only when the description is the string the
+    ///   account was taken from, ends with those bytes and leaves text
+    ///   before them.
     ///
     /// That suffix is the one change a parse may make to a description's
     /// text. Nothing is removed for its script, its punctuation or its
     /// length, and nothing is cut back to a sentence end: whether a ragged
     /// description holds whole sentences is a consumer's reading of the
-    /// marked text. Settling is idempotent: a settled description parsed
-    /// again with the same account settles to itself, since the boundary
-    /// then falls at or past its end.
+    /// marked text. Settling is idempotent by construction: the account
+    /// describes one string and can remove only the bytes it names, so a
+    /// settled description — shorter than that string, or that string left
+    /// whole — parsed again with the same account settles to itself.
     ///
     /// # Errors
     ///
@@ -1140,7 +1142,7 @@ Rules:
     pub fn parse_with_description_end(
       &self,
       raw: &str,
-      end: FieldEnd,
+      end: &FieldEnd,
     ) -> Result<ImageAnalysis, JsonParseError> {
       self.parse_ended(raw, Some(end))
     }
@@ -1157,15 +1159,19 @@ Rules:
   /// Whether the grammar closed the string at its `maxLength`
   /// ([`Self::CAP`]) or the model did ([`Self::MODEL`]); and, when the
   /// string's last token was cut — its bytes an incomplete sequence the
-  /// detokenizer decoded as U+FFFD — where that token's text begins
-  /// ([`Self::with_cut_at`]): a byte offset into the string as the answer
-  /// carries it (JSON-decoded, before any trimming), everything from which
-  /// is that token's. A flag saying only *that* a token was cut is not an
-  /// account of which bytes: with none, nothing is removed.
-  #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+  /// detokenizer decoded as U+FFFD — that token's text, named against the
+  /// string it ends ([`Self::with_cut`]). The account names the suffix by
+  /// its BYTES, never by a position: a position moves when the text is
+  /// trimmed, and a second parse would read it in other coordinates. And it
+  /// describes that one string: a description that is not it — a settled
+  /// one, shorter by the suffix or by its trimming — is never cut again. A
+  /// flag saying only *that* a token was cut is not an account of which
+  /// bytes: with none, nothing is removed.
+  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
   pub struct FieldEnd {
     closed_at_cap: bool,
-    cut_at: Option<usize>,
+    /// The cut token's text, and the byte length of the string it ends.
+    cut: Option<(SmolStr, usize)>,
   }
 
   impl FieldEnd {
@@ -1173,14 +1179,14 @@ Rules:
     /// go on.
     pub const MODEL: Self = Self {
       closed_at_cap: false,
-      cut_at: None,
+      cut: None,
     };
 
     /// The grammar closed the string at the field's `maxLength`: the model
     /// was left no choice but to end it there.
     pub const CAP: Self = Self {
       closed_at_cap: true,
-      cut_at: None,
+      cut: None,
     };
 
     /// Whether the grammar closed the string at the field's `maxLength`.
@@ -1189,22 +1195,33 @@ Rules:
       self.closed_at_cap
     }
 
-    /// Where the cut last token's text begins, in bytes of the string as
-    /// the answer carries it, when the decoder named one.
+    /// The cut last token's text, when the decoder named one — see
+    /// [`Self::with_cut`].
     #[cfg_attr(not(tarpaulin), inline(always))]
-    pub const fn cut_at(&self) -> Option<usize> {
-      self.cut_at
+    pub fn cut(&self) -> Option<&str> {
+      self.cut.as_ref().map(|(suffix, _)| suffix.as_str())
     }
 
-    /// Builder-style setter for [`Self::cut_at`]: the string's last token
-    /// was cut, and its text begins at byte `boundary` — the suffix from
-    /// there on is that token's bytes, and a string closed at the cap
-    /// loses it. Only the grammar's close cuts a token, so the model's own
-    /// end ([`Self::MODEL`]) ignores it.
+    /// Builder-style setter for [`Self::cut`]: the last token of `field`
+    /// was cut, and `suffix` is its text.
+    ///
+    /// # The contract
+    ///
+    /// The decoder passes the string **exactly as the answer carries it**
+    /// — JSON-decoded, untrimmed — as `field`, and the last token's text
+    /// exactly as `field` ends with it — the detokenizer's U+FFFD included
+    /// — as `suffix`. A description closed at the cap loses exactly those
+    /// bytes, and only when it is `field` (by its length) and ends with
+    /// them and keeps text before them; anything else (a suffix the text
+    /// does not end with, an empty one, one that is the whole text, a
+    /// description that is not `field`) removes nothing. So settling is
+    /// idempotent by construction: a settled description is shorter than
+    /// `field`, or is `field` itself left whole. Only the grammar's close
+    /// cuts a token, so the model's own end ([`Self::MODEL`]) ignores it.
     #[cfg_attr(not(tarpaulin), inline(always))]
     #[must_use]
-    pub const fn with_cut_at(mut self, boundary: usize) -> Self {
-      self.cut_at = Some(boundary);
+    pub fn with_cut(mut self, field: &str, suffix: &str) -> Self {
+      self.cut = Some((SmolStr::new(suffix), field.len()));
       self
     }
   }
@@ -1416,9 +1433,9 @@ Rules:
     /// settled by the decoder's account `ended` — see
     /// [`Self::parse_with_description_end`]. The text is kept as written,
     /// trimmed as every parse trims it, except for the one suffix a cap's
-    /// account names by its boundary: nothing is inferred from the text's
+    /// account names by its bytes: nothing is inferred from the text's
     /// length, its script or its punctuation.
-    fn settle_description(written: &str, ended: Option<FieldEnd>) -> (SmolStr, DescriptionEnd) {
+    fn settle_description(written: &str, ended: Option<&FieldEnd>) -> (SmolStr, DescriptionEnd) {
       let Some(ended) = ended else {
         return (SmolStr::new(written.trim()), DescriptionEnd::Unknown);
       };
@@ -1426,9 +1443,11 @@ Rules:
         return (SmolStr::new(written.trim()), DescriptionEnd::Whole);
       }
       let kept = ended
-        .cut_at()
-        .filter(|&at| at < written.len() && written.is_char_boundary(at))
-        .map(|at| written[..at].trim())
+        .cut
+        .as_ref()
+        .filter(|(suffix, field_len)| !suffix.is_empty() && written.len() == *field_len)
+        .and_then(|(suffix, _)| written.strip_suffix(suffix.as_str()))
+        .map(str::trim)
         .filter(|kept| !kept.is_empty())
         .unwrap_or_else(|| written.trim());
       (SmolStr::new(kept), DescriptionEnd::Ragged)
@@ -1471,7 +1490,7 @@ Rules:
     fn parse_ended(
       &self,
       raw: &str,
-      description_end: Option<FieldEnd>,
+      description_end: Option<&FieldEnd>,
     ) -> Result<ImageAnalysis, JsonParseError> {
       // Not a plain `serde_json::from_str` into a `Value` (see
       // `parse_members`'s doc comment): that collapses a duplicate
@@ -3852,7 +3871,7 @@ Rules:
           .expect("a JSON value serializes");
       let analysis = match end {
         None => task.parse(&answer),
-        Some(end) => task.parse_with_description_end(&answer, end),
+        Some(end) => task.parse_with_description_end(&answer, &end),
       }
       .unwrap_or_else(|e| panic!("{written:?} must parse: {e:?}"));
       (analysis.description().into(), analysis.description_end())
@@ -3880,10 +3899,13 @@ Rules:
       "A sign reads 'STOP! LOOK BOTH WAYS'",
     ];
 
-    /// The byte offset where `written`'s last character begins — the
-    /// boundary an engine names when it reports that token cut.
-    fn last_char(written: &str) -> usize {
-      written.char_indices().next_back().map_or(0, |(at, _)| at)
+    /// `written`'s last character, as the text an engine names when it
+    /// reports that token cut.
+    fn last_char(written: &str) -> &str {
+      written
+        .char_indices()
+        .next_back()
+        .map_or("", |(at, _)| &written[at..])
     }
 
     /// LAW (Codex R1): without the decoder's account nothing is deleted
@@ -3910,10 +3932,10 @@ Rules:
       for written in AT_THE_CAP {
         for end in [
           FieldEnd::MODEL,
-          FieldEnd::MODEL.with_cut_at(last_char(written)),
+          FieldEnd::MODEL.with_cut(written, last_char(written)),
         ] {
           assert_eq!(
-            settled(&capped_at(written), written, Some(end)),
+            settled(&capped_at(written), written, Some(end.clone())),
             (written.into(), crate::DescriptionEnd::Whole),
             "{written} under {end:?}"
           );
@@ -3957,17 +3979,23 @@ Rules:
       }
     }
 
-    /// LAW (Codex R2, [medium]): **only a suffix the decoder names by its
-    /// boundary is removed**, and only where that boundary falls inside the
-    /// text on a character boundary and leaves text before it. Every
-    /// trailing U+FFFD is not a cut token: with no boundary, nothing goes.
+    /// LAW (Codex R2–R3): **only the bytes the decoder names are removed**,
+    /// and only where the description ends with them and keeps text before
+    /// them. Every trailing U+FFFD is not a cut token: with no suffix named,
+    /// nothing goes; a suffix the text does not end with — one whose last
+    /// byte is the text's but whose character is not, the nearest a `&str`
+    /// comes to a cut inside a character — an empty suffix, and a suffix
+    /// that is the whole text all remove nothing.
     #[test]
     fn only_a_suffix_the_decoder_names_is_removed() {
       let written = "A cat sleeps on a rug\u{FFFD}\u{FFFD}";
       let task = capped_at(written);
-      let named = written.len() - '\u{FFFD}'.len_utf8();
       assert_eq!(
-        settled(&task, written, Some(FieldEnd::CAP.with_cut_at(named))),
+        settled(
+          &task,
+          written,
+          Some(FieldEnd::CAP.with_cut(written, "\u{FFFD}"))
+        ),
         (
           "A cat sleeps on a rug\u{FFFD}".into(),
           crate::DescriptionEnd::Ragged
@@ -3975,11 +4003,13 @@ Rules:
         "exactly the named token's bytes go"
       );
       for (end, why) in [
-        (FieldEnd::CAP, "no boundary named"),
-        (FieldEnd::CAP.with_cut_at(named + 1), "inside a character"),
-        (FieldEnd::CAP.with_cut_at(written.len()), "at the end"),
-        (FieldEnd::CAP.with_cut_at(written.len() + 4), "past the end"),
-        (FieldEnd::CAP.with_cut_at(0), "nothing left before it"),
+        (FieldEnd::CAP, "no suffix named"),
+        (FieldEnd::CAP.with_cut(written, ""), "an empty suffix"),
+        (
+          FieldEnd::CAP.with_cut(written, "dog\u{FFFD}"),
+          "a suffix the text does not end with",
+        ),
+        (FieldEnd::CAP.with_cut(written, written), "the whole text"),
       ] {
         assert_eq!(
           settled(&task, written, Some(end)),
@@ -3987,25 +4017,113 @@ Rules:
           "{why}"
         );
       }
+      // `é` is C3 A9 and `©` is C2 A9: the text's last byte is the
+      // suffix's, its last character is not.
+      let written = "A café";
+      assert_eq!(
+        settled(
+          &capped_at(written),
+          written,
+          Some(FieldEnd::CAP.with_cut(written, "\u{A9}"))
+        ),
+        (written.into(), crate::DescriptionEnd::Ragged),
+        "not a cut inside a character"
+      );
     }
 
-    /// LAW (Codex R1): settling is idempotent — a settled description
+    /// LAW (Codex R3, [high]): **a trimmed description re-settles to
+    /// itself.** The account names the suffix by its bytes, so trimming
+    /// moves nothing it means. The review's cap-7 `" abcdef"`, named whole
+    /// past its leading space, keeps `"abcdef"` — nothing would be left
+    /// before the suffix — and re-settles to `"abcdef"`, where an offset
+    /// read again in trimmed coordinates cut it to `"a"`. `"xyz abcdef"`
+    /// loses `"abcdef"` once and re-settles to `"xyz"`; leading whitespace
+    /// before a cut CJK token settles to its letters and stays there; and a
+    /// suffix repeated before itself (`"xaa"` less `"a"`) is removed once:
+    /// the account describes the string it was taken from, which the
+    /// settled `"xa"` is not.
+    #[test]
+    fn a_trimmed_description_resettles_to_itself() {
+      for (written, suffix, once) in [
+        (" abcdef", "abcdef", "abcdef"),
+        ("xyz abcdef", "abcdef", "xyz"),
+        ("  日本語\u{FFFD}", "\u{FFFD}", "日本語"),
+        ("  日本語 ", "語 ", "日本"),
+        // The named bytes repeat before themselves: the account describes the
+        // string it was taken from, and a settled one is not it.
+        ("A rug\u{FFFD}\u{FFFD}", "\u{FFFD}", "A rug\u{FFFD}"),
+        ("xaa", "a", "xa"),
+      ] {
+        let task = capped_at(written);
+        let end = FieldEnd::CAP.with_cut(written, suffix);
+        let first = settled(&task, written, Some(end.clone()));
+        assert_eq!(
+          first,
+          (once.into(), crate::DescriptionEnd::Ragged),
+          "{written:?}"
+        );
+        assert_eq!(
+          settled(&task, &first.0, Some(end)),
+          first,
+          "{written:?} re-settles to itself"
+        );
+      }
+    }
+
+    /// LAW (Codex R1–R3): settling is idempotent — a settled description
     /// parsed again with the same account settles to itself, and parsed
-    /// without one is kept as it stands.
+    /// without one is kept as it stands — over the fixtures, and as a
+    /// property over pseudo-random pairs of a text and a suffix drawn from
+    /// spaces, ASCII, CJK and U+FFFD, where the settled text is always
+    /// either the text trimmed or the text less exactly the named suffix,
+    /// trimmed.
     #[test]
     fn settling_is_idempotent() {
+      let once_more = |written: &str, end: FieldEnd| {
+        let task = capped_at(written);
+        let once = settled(&task, written, Some(end.clone()));
+        let twice = settled(&task, &once.0, Some(end.clone()));
+        assert_eq!(twice, once, "{written:?} under {end:?}");
+        assert_eq!(settled(&task, &once.0, None).0, once.0, "{written:?}");
+        once
+      };
       for written in AT_THE_CAP {
         for end in [
           FieldEnd::MODEL,
           FieldEnd::CAP,
-          FieldEnd::CAP.with_cut_at(last_char(written)),
+          FieldEnd::CAP.with_cut(written, last_char(written)),
         ] {
-          let task = capped_at(written);
-          let once = settled(&task, written, Some(end));
-          let twice = settled(&task, &once.0, Some(end));
-          assert_eq!(twice, once, "{written} under {end:?}");
-          assert_eq!(settled(&task, &once.0, None).0, once.0, "{written}");
+          once_more(written, end);
         }
+      }
+
+      const PIECES: [&str; 8] = [" ", "a", "b", "日", "本", "\u{FFFD}", "  ", "語"];
+      let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+      let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+      };
+      for _ in 0..2_000 {
+        // Some text the parse holds: a letter somewhere among the pieces.
+        let mut pieces: Vec<&str> = (0..next(8)).map(|_| PIECES[next(PIECES.len())]).collect();
+        let letter = ["a", "b", "日", "本", "語"][next(5)];
+        let at = next(pieces.len() + 1);
+        pieces.insert(at, letter);
+        let text: String = pieces.concat();
+        let suffix: String = (0..next(4)).map(|_| PIECES[next(PIECES.len())]).collect();
+        let (settled, end) = once_more(&text, FieldEnd::CAP.with_cut(&text, &suffix));
+        assert_eq!(end, crate::DescriptionEnd::Ragged);
+        let less = text
+          .strip_suffix(suffix.as_str())
+          .filter(|_| !suffix.is_empty())
+          .map(str::trim)
+          .filter(|kept| !kept.is_empty());
+        assert!(
+          settled == text.trim() || less == Some(settled.as_str()),
+          "{text:?} less {suffix:?} settled to {settled:?}"
+        );
       }
     }
 

@@ -11,22 +11,25 @@
   `Unknown` — clearing included — since the old text's ending says
   nothing about the new one; a caller with the decoder's account sets it
   afterwards.
-- `image_analysis::FieldEnd` (`FieldEnd::MODEL`, `FieldEnd::CAP`,
-  `with_cut_at`) and `ImageAnalysisTask::parse_with_description_end`
+- `image_analysis::FieldEnd` (`FieldEnd::MODEL`, `FieldEnd::CAP`, `cut`,
+  `with_cut`) and `ImageAnalysisTask::parse_with_description_end`
   (findit-studio/application#235). A constrained decoder ends the
   description at the schema's `maxLength` wherever the sentence had got to,
   and only the decoder knows whether it closed the string there or the
   model did: an answer that ends exactly at the cap reads the same either
   way. `FieldEnd` is the decoder's account — whether the grammar closed the
-  string at the cap, and, when the string's last token was cut, the byte
-  offset where that token's text begins — and `parse_with_description_end`
-  settles the description by it: the model's own end is `Whole` at any
-  length; a string closed at the cap is `Ragged`, kept as written less only
-  the suffix from the named boundary on (when it falls inside the text on a
-  character boundary and leaves text before it). The parser never cuts a
-  description back to a sentence end; whether a ragged one holds whole
-  sentences is a consumer's reading of the marked text. Settling is
-  idempotent.
+  string at the cap, and, when the string's last token was cut, that
+  token's text, named against the string it ends (`with_cut(field,
+  suffix)`) — and `parse_with_description_end` settles the description by
+  it: the model's own end is `Whole` at any length; a string closed at the
+  cap is `Ragged`, kept as written less exactly the named bytes, and only
+  when the description is that string, ends with them and keeps text
+  before them. The account names the suffix by its bytes, never by a
+  position, so trimming moves nothing it means, and a settled description
+  — shorter than the string, or the string left whole — re-settles to
+  itself. The parser never cuts a description back to a sentence end;
+  whether a ragged one holds whole sentences is a consumer's reading of the
+  marked text.
 
 `Task::parse` is unchanged: it has the answer's text alone, so it keeps
 the description as written and marks it `DescriptionEnd::Unknown`. A

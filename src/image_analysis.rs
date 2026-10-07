@@ -329,28 +329,32 @@ impl ImageAnalysis {
 /// A task that caps the description's length — the canonical
 /// `ImageAnalysisTask` states its cap as the schema's `maxLength` — has
 /// it closed by a constrained decoder at the cap, wherever the sentence
-/// had got to. The decoder's last token there is whatever single
-/// character still fitted, and a model asked for English can pick a lone
-/// CJK character for it (findit-studio/application#235:
-/// `…facing forward with a neutral,略`). `ImageAnalysisTask::parse`
-/// settles such an end and records here what it did, so a caption that
-/// is still cut is never mistaken for a whole one.
+/// had got to (findit-studio/application#235:
+/// `…facing forward with a neutral,略`). Only the decoder knows whether it
+/// closed a string or the model did: an answer that ends exactly at the
+/// cap reads the same either way. So this fact comes from the engine's
+/// account ([`FieldEnd`], handed to
+/// `ImageAnalysisTask::parse_with_description_end`), and without one it
+/// is [`Unknown`](Self::Unknown) and the text is kept as written.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum DescriptionEnd {
-  /// The description ends where its writer ended it: short of the cap,
-  /// or at the cap on a sentence end. The default, and what a
-  /// description built by hand holds.
+  /// Nothing says how the description ended: it was parsed without the
+  /// decoder's account (`Task::parse`), or built by hand. The default; the
+  /// text is as the answer wrote it.
   #[default]
+  Unknown,
+  /// The model ended the description itself, whatever its length.
   Whole,
-  /// The description reached the cap mid-sentence and was trimmed back
-  /// to its last sentence end, so it holds whole sentences only.
+  /// The grammar closed the description at the cap on a sentence end, or
+  /// it was cut back to its last unambiguous one (the task's
+  /// `sentence_cut_back`), so it holds whole sentences.
   Sentence,
-  /// The description reached the cap with no sentence end in it at all.
-  /// It is returned whole rather than emptied, less the partial token the
-  /// cap left behind, and ends where the cap stopped it.
+  /// The grammar closed the description at the cap mid-sentence. It is
+  /// kept whole — less a last token the decoder reports it cut — and ends
+  /// where the cap stopped it.
   Ragged,
 }
 
@@ -388,12 +392,11 @@ mod tests {
     assert_eq!(s.categories().len(), 1);
   }
 
-  /// A document written before `description_end` existed reads as a
-  /// whole description, and a ragged one round-trips by its snake-case
-  /// name.
+  /// A document written before `description_end` existed reads as an
+  /// unknown end, and a ragged one round-trips by its snake-case name.
   #[cfg(all(feature = "serde", feature = "json"))]
   #[test]
-  fn description_end_reads_whole_when_absent_and_round_trips() {
+  fn description_end_reads_unknown_when_absent_and_round_trips() {
     let mut older = serde_json::to_value(ImageAnalysis::new().with_description("A cat sleeps."))
       .expect("an analysis serializes");
     older
@@ -402,7 +405,7 @@ mod tests {
       .remove("description_end")
       .expect("it carries the key");
     let older: ImageAnalysis = serde_json::from_value(older).expect("an older document reads");
-    assert_eq!(older.description_end(), DescriptionEnd::Whole);
+    assert_eq!(older.description_end(), DescriptionEnd::Unknown);
 
     let ragged = ImageAnalysis::new()
       .with_description("A cat sleeps on a")
@@ -432,7 +435,7 @@ mod tests {
 
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-pub use image_analysis_task::{Extension, ImageAnalysisTask, UnknownExtension};
+pub use image_analysis_task::{Extension, FieldEnd, ImageAnalysisTask, UnknownExtension};
 
 /// The `ImageAnalysisTask` implementation. Grouped in its own private
 /// module (mirroring `task::json`'s pattern) so the whole surface —
@@ -890,6 +893,7 @@ Rules:
     description_max_chars: NonZeroUsize,
     tags_max_items: NonZeroUsize,
     accept_empty: bool,
+    sentence_cut_back: bool,
     // Both derived from `extensions` and the two caps by `rebuild`, which
     // every setter of those three calls, so the schema, the prompt and
     // `parse` always describe the same roster.
@@ -923,6 +927,7 @@ Rules:
         description_max_chars: Self::DEFAULT_DESCRIPTION_MAX_CHARS,
         tags_max_items: Self::DEFAULT_TAGS_MAX_ITEMS,
         accept_empty: false,
+        sentence_cut_back: false,
         schema: Value::Null,
         prompt: String::new(),
       };
@@ -1059,6 +1064,127 @@ Rules:
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn set_accept_empty(&mut self, val: bool) -> &mut Self {
       self.accept_empty = val;
+      self
+    }
+
+    // --- sentence_cut_back ---
+
+    /// Whether a description the decoder reports it closed at the cap
+    /// mid-sentence is cut back to its last UNAMBIGUOUS sentence end. Off
+    /// by default: the cut drops words, and only a boundary no reading
+    /// could take for anything else qualifies — see
+    /// [`Self::with_sentence_cut_back`].
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn sentence_cut_back(&self) -> bool {
+      self.sentence_cut_back
+    }
+
+    /// Builder-style setter for `sentence_cut_back`.
+    ///
+    /// When on, [`Self::parse_with_description_end`] cuts a description
+    /// the decoder closed at the cap back to its last unambiguous sentence
+    /// end, marked [`DescriptionEnd::Sentence`]. A boundary is unambiguous
+    /// when a `.`, `!` or `?` stands outside double quotes, is followed by
+    /// whitespace and a capital letter, and — for a `.` — does not end an
+    /// abbreviation (`Dr.`, `e.g.`) or an initial (`J.`); or when a `。`,
+    /// `！` or `？` stands outside CJK and double quotes. Punctuation that
+    /// closes a quotation (`"Ready?" while…`) is never one. A description
+    /// with no such boundary is kept whole, [`DescriptionEnd::Ragged`].
+    /// Without the decoder's account nothing is ever cut.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn with_sentence_cut_back(mut self, val: bool) -> Self {
+      self.sentence_cut_back = val;
+      self
+    }
+
+    /// In-place setter for `sentence_cut_back`. See
+    /// [`Self::with_sentence_cut_back`].
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn set_sentence_cut_back(&mut self, val: bool) -> &mut Self {
+      self.sentence_cut_back = val;
+      self
+    }
+
+    // --- parsing with the decoder's account ---
+
+    /// [`Task::parse`], with the constrained decoder's account of how it
+    /// ended the description: whether the grammar closed it at the
+    /// field's `maxLength`, and whether the last token's bytes were cut.
+    ///
+    /// `Task::parse` has the answer's text alone, and text cannot tell a
+    /// string the grammar closed at the cap from one the model ended at
+    /// exactly that length — so it keeps the description as written and
+    /// marks it [`DescriptionEnd::Unknown`]. With `end`:
+    ///
+    /// - the model ended it: kept as written, [`DescriptionEnd::Whole`],
+    ///   whatever its length;
+    /// - the grammar closed it at the cap: the trailing U+FFFD of a last
+    ///   token the decoder reports it cut goes (and nothing else is ever
+    ///   removed for its script); a description that then ends on an
+    ///   unambiguous sentence end is [`DescriptionEnd::Sentence`]; with
+    ///   [`sentence_cut_back`](Self::sentence_cut_back) on, one that does
+    ///   not is cut back to its last unambiguous one, else kept whole and
+    ///   [`DescriptionEnd::Ragged`] — never emptied.
+    ///
+    /// Settling is idempotent: a settled description parsed again with
+    /// the same account settles to itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`Task::parse`].
+    pub fn parse_with_description_end(
+      &self,
+      raw: &str,
+      end: FieldEnd,
+    ) -> Result<ImageAnalysis, JsonParseError> {
+      self.parse_ended(raw, Some(end))
+    }
+  }
+
+  /// How a constrained decoder ended one string field of an answer — the
+  /// account [`ImageAnalysisTask::parse_with_description_end`] settles the
+  /// description by. An engine that decodes under the task's grammar
+  /// knows it at the step it closes the string; the answer's text does
+  /// not carry it.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+  pub struct FieldEnd {
+    closed_at_cap: bool,
+    last_token_cut: bool,
+  }
+
+  impl FieldEnd {
+    /// The model closed the string itself: the grammar would have let it
+    /// go on.
+    pub const MODEL: Self = Self {
+      closed_at_cap: false,
+      last_token_cut: false,
+    };
+
+    /// The grammar closed the string at the field's `maxLength`: the model
+    /// was left no choice but to end it there.
+    pub const CAP: Self = Self {
+      closed_at_cap: true,
+      last_token_cut: false,
+    };
+
+    /// Whether the grammar closed the string at the field's `maxLength`.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn closed_at_cap(&self) -> bool {
+      self.closed_at_cap
+    }
+
+    /// Whether the string's last token was cut short — its partial UTF-8
+    /// sequence decoded as U+FFFD.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn last_token_cut(&self) -> bool {
+      self.last_token_cut
+    }
+
+    /// Builder-style setter for [`Self::last_token_cut`].
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
+    pub const fn with_last_token_cut(mut self, cut: bool) -> Self {
+      self.last_token_cut = cut;
       self
     }
   }
@@ -1266,126 +1392,128 @@ Rules:
     }
 
     /// `written`, the description as the answer wrote it, as
-    /// [`ImageAnalysis`] holds it, and how it ends ([`DescriptionEnd`]).
-    ///
-    /// A description short of the cap ends where the model ended it and is
-    /// only trimmed of whitespace. One that reached the cap was closed
-    /// there by the constrained decoder, mid-clause as often as not, and
-    /// its last token is whatever single character still fitted. So:
-    ///
-    /// 1. The partial token the cap left goes: trailing U+FFFD (what a
-    ///    detokenizer leaves of an incomplete UTF-8 sequence) and a lone
-    ///    CJK letter after text that is not one — `neutral,略`, `rug on木`
-    ///    (findit-studio/application#235). A CJK description keeps its
-    ///    last character: there it is text, not a stray.
-    /// 2. What is left that ends on a sentence end (`.`, `!`, `?`, `。`,
-    ///    `！`, `？`, closing quotes and brackets after it allowed) is
-    ///    kept: [`DescriptionEnd::Whole`] when nothing was removed,
-    ///    [`DescriptionEnd::Sentence`] when the stray was.
-    /// 3. Otherwise it is cut back to its last sentence end, so it holds
-    ///    whole sentences only: [`DescriptionEnd::Sentence`].
-    /// 4. With no sentence end in it at all, it is kept whole, ragged
-    ///    end and all, and never emptied: [`DescriptionEnd::Ragged`].
-    ///
-    /// This trims an answer the decoder already cut; it never truncates
-    /// one to fit a cap — an answer over the cap is still refused by name
-    /// (see [`Self::exceeds_cap`]).
-    fn settle_description(&self, written: &str) -> (SmolStr, DescriptionEnd) {
+    /// [`ImageAnalysis`] holds it, and how it ends ([`DescriptionEnd`]),
+    /// settled by the decoder's account `ended` — see
+    /// [`Self::parse_with_description_end`]. Without one the text is kept
+    /// as written: nothing is inferred from its length or its script.
+    fn settle_description(
+      &self,
+      written: &str,
+      ended: Option<FieldEnd>,
+    ) -> (SmolStr, DescriptionEnd) {
       let whole = written.trim();
-      if written.chars().count() < self.description_max_chars.get() {
+      let Some(ended) = ended else {
+        return (SmolStr::new(whole), DescriptionEnd::Unknown);
+      };
+      if !ended.closed_at_cap() {
         return (SmolStr::new(whole), DescriptionEnd::Whole);
       }
-      let kept = without_partial_token(whole);
+      let kept = if ended.last_token_cut() {
+        whole
+          .trim_end_matches(char::REPLACEMENT_CHARACTER)
+          .trim_end()
+      } else {
+        whole
+      };
       if kept.is_empty() {
         return (SmolStr::new(whole), DescriptionEnd::Ragged);
       }
       if ends_a_sentence(kept) {
-        let end = if kept.len() == whole.len() {
-          DescriptionEnd::Whole
-        } else {
-          DescriptionEnd::Sentence
-        };
-        return (SmolStr::new(kept), end);
+        return (SmolStr::new(kept), DescriptionEnd::Sentence);
       }
-      match last_sentence_end(kept) {
-        Some(end) => (
+      if self.sentence_cut_back
+        && let Some(end) = last_sentence_end(kept)
+      {
+        return (
           SmolStr::new(kept[..end].trim_end()),
           DescriptionEnd::Sentence,
-        ),
-        None => (SmolStr::new(kept), DescriptionEnd::Ragged),
+        );
       }
+      (SmolStr::new(kept), DescriptionEnd::Ragged)
     }
   }
 
-  /// A sentence's closing punctuation: the ASCII three and their
-  /// full-width CJK forms.
-  const SENTENCE_ENDS: [char; 6] = ['.', '!', '?', '。', '！', '？'];
+  /// Words a `.` ends without ending a sentence, compared without case.
+  const ABBREVIATIONS: [&str; 22] = [
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "mt", "vs", "etc", "e.g", "i.e", "no",
+    "inc", "ltd", "co", "corp", "dept", "fig", "approx", "u.s",
+  ];
 
-  /// What may follow a sentence's closing punctuation inside the
-  /// sentence: closing quotes and brackets (`he said "stop."`).
-  const CLOSERS: [char; 8] = ['"', '\'', '\u{201D}', '\u{2019}', ')', ']', '」', '』'];
-
-  /// Whether `c` is a letter of a CJK script: a Han ideograph, kana,
-  /// Hangul or Bopomofo. CJK punctuation is not one — a full-width `。`
-  /// or a `」` is how a sentence or a quote ends, not a stray.
-  fn is_cjk_letter(c: char) -> bool {
-    matches!(
-      c,
-      '\u{1100}'..='\u{11FF}'
-        | '\u{3040}'..='\u{30FF}'
-        | '\u{3100}'..='\u{312F}'
-        | '\u{3130}'..='\u{318F}'
-        | '\u{31F0}'..='\u{31FF}'
-        | '\u{3400}'..='\u{4DBF}'
-        | '\u{4E00}'..='\u{9FFF}'
-        | '\u{AC00}'..='\u{D7AF}'
-        | '\u{F900}'..='\u{FAFF}'
-        | '\u{FF66}'..='\u{FF9F}'
-        | '\u{20000}'..='\u{2FFFF}'
-    )
+  /// Whether the `.` at byte `at` of `text` ends an abbreviation or an
+  /// initial rather than a sentence: the word before it is one letter
+  /// (`J.`), holds a `.` of its own (`U.S.`), or is a known abbreviation.
+  fn ends_an_abbreviation(text: &str, at: usize) -> bool {
+    let word = text[..at]
+      .rsplit(|c: char| c.is_whitespace() || matches!(c, '(' | '"' | '\'' | '“' | '‘'))
+      .next()
+      .unwrap_or("");
+    word.chars().count() == 1
+      || word.contains('.')
+      || ABBREVIATIONS
+        .iter()
+        .any(|abbreviation| word.eq_ignore_ascii_case(abbreviation))
   }
 
-  /// `text` less the partial token a length cap leaves at its end:
-  /// trailing U+FFFD, then one CJK letter after text that is not one,
-  /// then the whitespace before them.
-  fn without_partial_token(text: &str) -> &str {
-    let text = text.trim_end_matches(char::REPLACEMENT_CHARACTER);
-    let mut chars = text.chars().rev();
-    if let (Some(last), Some(before)) = (chars.next(), chars.next())
-      && is_cjk_letter(last)
-      && !is_cjk_letter(before)
-    {
-      return text[..text.len() - last.len_utf8()].trim_end();
+  /// Whether byte `at` of `text` stands inside a quotation: an odd number
+  /// of `"` before it, or more opening than closing `“`/`”`, `「`/`」`,
+  /// `『`/`』` before it.
+  fn inside_quotes(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    let count = |c: char| before.matches(c).count();
+    count('"') % 2 == 1
+      || count('“') > count('”')
+      || count('「') > count('」')
+      || count('『') > count('』')
+  }
+
+  /// Whether the sentence-ending punctuation `c` at byte `at` of `text`
+  /// ends a sentence beyond doubt, given `rest`, the text after it. See
+  /// [`ImageAnalysisTask::with_sentence_cut_back`] for the rule.
+  fn unambiguous_end(text: &str, at: usize, c: char, rest: &str) -> bool {
+    if inside_quotes(text, at) {
+      return false;
     }
-    text.trim_end()
+    match c {
+      '。' | '！' | '？' => true,
+      '.' | '!' | '?' => {
+        let after = rest.trim_start();
+        rest.starts_with(char::is_whitespace)
+          && after.starts_with(char::is_uppercase)
+          && !(c == '.' && ends_an_abbreviation(text, at))
+      }
+      _ => false,
+    }
   }
 
-  /// Whether `text` ends on a sentence end, closers after it allowed.
+  /// Whether `text` ends on an unambiguous sentence end: its last
+  /// character is a `.`, `!` or `?` that ends no abbreviation and stands
+  /// outside quotes, or a full-width `。`, `！` or `？` outside quotes. A
+  /// quotation closing after the punctuation (`…"Stop."`) is not one.
   fn ends_a_sentence(text: &str) -> bool {
-    text.trim_end_matches(CLOSERS).ends_with(SENTENCE_ENDS)
+    let Some((at, c)) = text.char_indices().next_back() else {
+      return false;
+    };
+    if inside_quotes(text, at) {
+      return false;
+    }
+    match c {
+      '。' | '！' | '？' | '!' | '?' => true,
+      '.' => !ends_an_abbreviation(text, at),
+      _ => false,
+    }
   }
 
-  /// The byte offset just past `text`'s last sentence end — its closing
-  /// punctuation and any closers after it — or `None` when it has none.
-  /// An ASCII `.`, `!` or `?` ends a sentence only when whitespace
-  /// follows its closers, so `3.5` and `.com` do not; a full-width one
-  /// ends it wherever it stands, since CJK writing puts no space after
-  /// it.
+  /// The byte offset just past `text`'s last unambiguous sentence end, or
+  /// `None` when it has none.
   fn last_sentence_end(text: &str) -> Option<usize> {
-    let mut found = None;
-    for (index, c) in text.char_indices() {
-      if !SENTENCE_ENDS.contains(&c) {
-        continue;
-      }
-      let after = index + c.len_utf8();
-      let rest = &text[after..];
-      let end = after + (rest.len() - rest.trim_start_matches(CLOSERS).len());
-      let full_width = matches!(c, '。' | '！' | '？');
-      if full_width || text[end..].starts_with(char::is_whitespace) {
-        found = Some(end);
-      }
-    }
-    found
+    text
+      .char_indices()
+      .filter(|&(at, c)| {
+        let after = at + c.len_utf8();
+        unambiguous_end(text, at, c, &text[after..])
+      })
+      .map(|(at, c)| at + c.len_utf8())
+      .next_back()
   }
 
   impl Default for ImageAnalysisTask {
@@ -1414,6 +1542,18 @@ Rules:
     }
 
     fn parse(&self, raw: &str) -> Result<Self::Output, JsonParseError> {
+      self.parse_ended(raw, None)
+    }
+  }
+
+  impl ImageAnalysisTask {
+    /// [`Task::parse`]'s body, with the decoder's account of how it ended
+    /// the description when there is one.
+    fn parse_ended(
+      &self,
+      raw: &str,
+      description_end: Option<FieldEnd>,
+    ) -> Result<ImageAnalysis, JsonParseError> {
       // Not a plain `serde_json::from_str` into a `Value` (see
       // `parse_members`'s doc comment): that collapses a duplicate
       // top-level member — later overwrites earlier — before any check
@@ -1462,7 +1602,7 @@ Rules:
         match field {
           Field::Scene => result.set_scene(value.into_label()),
           Field::Description => {
-            let (description, end) = self.settle_description(&value.into_string());
+            let (description, end) = self.settle_description(&value.into_string(), description_end);
             result.set_description(description).set_description_end(end)
           }
           Field::Subjects => result.set_subjects(value.into_labels()),
@@ -3207,8 +3347,9 @@ Rules:
     }
 
     /// An answer over a cap is refused by name, as a missing field is,
-    /// and an answer at a cap with no sentence end parses whole, marked
-    /// ragged: `parse` never truncates an answer to fit a cap.
+    /// and an answer at a cap parses whole: `parse` never truncates an
+    /// answer to fit a cap, and without the decoder's account it does not
+    /// know how the answer ended.
     /// `description` is counted in characters, not bytes, and as the answer
     /// wrote it; `tags` in the elements of its array.
     #[test]
@@ -3226,7 +3367,7 @@ Rules:
         .parse(&format!(r#"{{"description":"{at_cap}","tags":["a"]}}"#))
         .expect("a description of ten two-byte characters is at the cap");
       assert_eq!(analysis.description(), at_cap);
-      assert_eq!(analysis.description_end(), crate::DescriptionEnd::Ragged);
+      assert_eq!(analysis.description_end(), crate::DescriptionEnd::Unknown);
       let over_cap = "é".repeat(11);
       assert_eq!(
         refusal(&format!(r#"{{"description":"{over_cap}","tags":["a"]}}"#)),
@@ -3776,182 +3917,180 @@ Rules:
       }
     }
 
-    // ===== a description that reached the cap (application#235) =====
+    // ===== a description the decoder closed at the cap (application#235) =====
 
-    /// The description `task` settles from `written`, and how it ends.
-    fn settled(task: &ImageAnalysisTask, written: &str) -> (String, crate::DescriptionEnd) {
+    /// The description `task` settles from `written`, and how it ends —
+    /// through `Task::parse` when `end` is `None`, else through
+    /// `parse_with_description_end`.
+    fn settled(
+      task: &ImageAnalysisTask,
+      written: &str,
+      end: Option<FieldEnd>,
+    ) -> (String, crate::DescriptionEnd) {
       let answer =
         serde_json::to_string(&serde_json::json!({ "description": written, "tags": ["label"] }))
           .expect("a JSON value serializes");
-      let analysis = task
-        .parse(&answer)
-        .unwrap_or_else(|e| panic!("{written:?} must parse: {e:?}"));
+      let analysis = match end {
+        None => task.parse(&answer),
+        Some(end) => task.parse_with_description_end(&answer, end),
+      }
+      .unwrap_or_else(|e| panic!("{written:?} must parse: {e:?}"));
       (analysis.description().into(), analysis.description_end())
     }
 
-    /// LAW (application#235): the two captions the issue quotes, each cut
-    /// by the default 120-character cap with a stray CJK letter as the
-    /// decoder's last token, lose the stray and are marked ragged — no
-    /// sentence end in either to cut back to, so each is kept whole rather
-    /// than emptied.
-    #[test]
-    fn the_issues_cut_captions_lose_their_stray_and_are_marked_ragged() {
-      let task = ImageAnalysisTask::new();
-      for (written, kept) in [
-        (
-          "A person wearing a white t-shirt with 'PLAYFUL OF CLASSIC' printed on it stands indoors, facing forward with a neutral,略",
-          "A person wearing a white t-shirt with 'PLAYFUL OF CLASSIC' printed on it stands indoors, facing forward with a neutral,",
-        ),
-        (
-          "A dimly lit room features a wooden chair with a white cushion, a small wooden desk with drawers, and a patterned rug on木",
-          "A dimly lit room features a wooden chair with a white cushion, a small wooden desk with drawers, and a patterned rug on",
-        ),
-      ] {
-        assert_eq!(
-          written.chars().count(),
-          120,
-          "the issue's caption is at the cap"
-        );
-        assert_eq!(
-          settled(&task, written),
-          (kept.into(), crate::DescriptionEnd::Ragged)
-        );
-      }
-    }
-
-    /// The task whose cap `written` reached: capped at its length.
+    /// The task whose cap `written` reaches: capped at its length.
     fn capped_at(written: &str) -> ImageAnalysisTask {
       ImageAnalysisTask::new().with_description_max_chars(nz(written.chars().count()))
     }
 
-    /// LAW: a description that reached the cap mid-sentence after a whole
-    /// one is cut back to that sentence's end, stray or no stray, and
-    /// closing quotes after the punctuation stay with their sentence.
+    /// The issue's two captions, the reviews' counter-examples, and the
+    /// shapes the rules below turn on — each at its own cap.
+    const AT_THE_CAP: [&str; 9] = [
+      "A person wearing a white t-shirt with 'PLAYFUL OF CLASSIC' printed on it stands indoors, facing forward with a neutral,略",
+      "A dimly lit room features a wooden chair with a white cushion, a small wooden desk with drawers, and a patterned rug on木",
+      "A wooden sign is printed with 愛",
+      "A portrait of Dr. Smith standing beside a desk in a quiet office",
+      "A screen asks \"Ready?\" while runners wait at the line",
+      "J. R. R. Tolkien's books stand on a shelf beside a lamp",
+      "A cat sleeps on a rug\u{FFFD}",
+      "Two people talk across a desk. A lamp glows on a shelf behind",
+      "台所で二人が話している。窓の外は雨が降っていて、壁の時計は",
+    ];
+
+    /// LAW (Codex R1): without the decoder's account nothing is deleted
+    /// or inferred. Text cannot tell a string the grammar closed at the cap
+    /// from one the model ended at exactly that length, a stray from a
+    /// word in another script, or an abbreviation from a sentence end — so
+    /// `Task::parse` keeps every description as written, `Unknown`.
     #[test]
-    fn a_capped_description_is_cut_back_to_its_last_sentence_end() {
-      for (written, kept) in [
-        (
-          "Two people talk across a desk. A lamp glows on a shelf behind",
-          "Two people talk across a desk.",
-        ),
-        (
-          "Two people talk across a desk. A lamp glows on a shelf beh略",
-          "Two people talk across a desk.",
-        ),
-        (
-          "A sign reads \"OPEN TODAY!\" A man in a cap stands by the doo",
-          "A sign reads \"OPEN TODAY!\"",
-        ),
-        (
-          "台所で二人が話している。窓の外は雨が降っていて、テーブルの上には湯気の立つ二つのカップと開いた本が置かれ、壁の時計は",
-          "台所で二人が話している。",
-        ),
-      ] {
+    fn parse_without_the_decoders_account_deletes_nothing() {
+      for written in AT_THE_CAP {
         assert_eq!(
-          settled(&capped_at(written), written),
-          (kept.into(), crate::DescriptionEnd::Sentence),
+          settled(&capped_at(written), written, None),
+          (written.into(), crate::DescriptionEnd::Unknown),
           "{written}"
         );
       }
     }
 
-    /// LAW: a description that reached the cap on a sentence end is whole;
-    /// one whose sentence end only a stray stood after is that sentence;
-    /// one with no sentence end loses its stray and is ragged.
+    /// LAW: a description the model ended is `Whole` whatever its length —
+    /// at the cap included — and kept as written.
     #[test]
-    fn a_capped_description_on_a_sentence_end_keeps_it() {
-      for (written, kept, end) in [
-        (
-          "Two people talk across a desk.",
-          "Two people talk across a desk.",
-          crate::DescriptionEnd::Whole,
-        ),
-        (
-          "Two people talk across a desk.略",
-          "Two people talk across a desk.",
-          crate::DescriptionEnd::Sentence,
-        ),
-        (
-          "Two people talk across a desk略",
-          "Two people talk across a desk",
-          crate::DescriptionEnd::Ragged,
-        ),
-        (
-          "雨の台所で二人が話す。",
-          "雨の台所で二人が話す。",
-          crate::DescriptionEnd::Whole,
-        ),
-      ] {
+    fn a_description_the_model_ended_is_whole_at_any_length() {
+      for written in AT_THE_CAP {
         assert_eq!(
-          settled(&capped_at(written), written),
-          (kept.into(), end),
+          settled(&capped_at(written), written, Some(FieldEnd::MODEL)),
+          (written.into(), crate::DescriptionEnd::Whole),
           "{written}"
         );
       }
     }
 
-    /// LAW: what a detokenizer leaves of an incomplete UTF-8 sequence —
-    /// U+FFFD — never reaches the row, and a CJK description keeps its last
-    /// letter: there it is text, not a stray.
+    /// LAW (application#235): a description the grammar closed at the cap
+    /// mid-sentence lands `Ragged`, kept whole: the issue's captions keep
+    /// their last token — a whole token, not a cut one — and the caption
+    /// says it is cut. Only a last token the decoder reports cut loses its
+    /// U+FFFD; nothing goes for its script.
     #[test]
-    fn a_replacement_character_goes_and_a_cjk_description_keeps_its_letter() {
+    fn a_description_closed_at_the_cap_is_ragged_and_kept_whole() {
+      for written in &AT_THE_CAP[..7] {
+        assert_eq!(
+          settled(&capped_at(written), written, Some(FieldEnd::CAP)),
+          ((*written).into(), crate::DescriptionEnd::Ragged),
+          "{written}"
+        );
+      }
       let written = "A cat sleeps on a rug\u{FFFD}";
       assert_eq!(
-        settled(&capped_at(written), written),
+        settled(
+          &capped_at(written),
+          written,
+          Some(FieldEnd::CAP.with_last_token_cut(true))
+        ),
         (
           "A cat sleeps on a rug".into(),
           crate::DescriptionEnd::Ragged
         )
       );
-      let written = "台所で二人が話していて窓の外は雨が降っている";
+      let written = "Two people talk across a desk.";
       assert_eq!(
-        settled(&capped_at(written), written),
-        (written.into(), crate::DescriptionEnd::Ragged)
+        settled(&capped_at(written), written, Some(FieldEnd::CAP)),
+        (written.into(), crate::DescriptionEnd::Sentence),
+        "closed at the cap on a sentence end"
       );
     }
 
-    /// LAW: a description short of the cap ends where the model ended it,
-    /// sentence end or not, and a `.` inside a number or a name is no
-    /// sentence end to cut back to.
+    /// LAW (Codex R1): the cut-back is off by default, and when on it cuts
+    /// only at an unambiguous sentence end — never after an abbreviation or
+    /// an initial, never at punctuation inside or closing a quotation —
+    /// and keeps the description whole and `Ragged` otherwise.
     #[test]
-    fn a_description_short_of_the_cap_is_whole_and_a_decimal_point_ends_nothing() {
-      let task = ImageAnalysisTask::new();
+    fn the_cut_back_is_off_by_default_and_cuts_only_at_an_unambiguous_end() {
+      let two = AT_THE_CAP[7];
       assert_eq!(
-        settled(&task, "  A dog runs on a beach  "),
-        ("A dog runs on a beach".into(), crate::DescriptionEnd::Whole)
+        settled(&capped_at(two), two, Some(FieldEnd::CAP)),
+        (two.into(), crate::DescriptionEnd::Ragged),
+        "off by default"
       );
-      let written = "A price card reads 3.5 euros at shop.example.com on a stall";
-      assert_eq!(
-        settled(&capped_at(written), written),
-        (written.into(), crate::DescriptionEnd::Ragged)
-      );
-    }
 
-    /// LAW, over every capped fixture above at once: a capped description
-    /// ends on a sentence end or is marked ragged, and none ends on a lone
-    /// CJK letter after other text, or on U+FFFD.
-    #[test]
-    fn a_capped_description_ends_a_sentence_or_says_it_is_ragged() {
-      for written in [
-        "A person wearing a white t-shirt with 'PLAYFUL OF CLASSIC' printed on it stands indoors, facing forward with a neutral,略",
-        "A dimly lit room features a wooden chair with a white cushion, a small wooden desk with drawers, and a patterned rug on木",
-        "Two people talk across a desk. A lamp glows on a shelf beh略",
-        "Two people talk across a desk.略",
-        "A cat sleeps on a rug\u{FFFD}",
-        "台所で二人が話している。窓の外は雨",
+      let cutting = |written: &str| {
+        settled(
+          &capped_at(written).with_sentence_cut_back(true),
+          written,
+          Some(FieldEnd::CAP),
+        )
+      };
+      assert_eq!(
+        cutting(two),
+        (
+          "Two people talk across a desk.".into(),
+          crate::DescriptionEnd::Sentence
+        )
+      );
+      assert_eq!(
+        cutting(AT_THE_CAP[8]),
+        (
+          "台所で二人が話している。".into(),
+          crate::DescriptionEnd::Sentence
+        )
+      );
+      for ambiguous in [
+        AT_THE_CAP[3],
+        AT_THE_CAP[4],
+        AT_THE_CAP[5],
+        "A sign reads \"OPEN TODAY!\" A man waits by the door of the shop",
+        "A poster says “Stop. Look.” beside a crossing in the town",
+        "店の看板に「休み。また明日」と書いてあり、通りは静か",
+        "Two people talk. a lamp glows on a shelf behind them all",
       ] {
-        let (description, end) = settled(&capped_at(written), written);
-        let mut tail = description.chars().rev();
-        let (last, before) = (tail.next(), tail.next());
-        assert!(
-          end == crate::DescriptionEnd::Ragged || ends_a_sentence(&description),
-          "{written} settled to {description:?}, {end:?}"
+        assert_eq!(
+          cutting(ambiguous),
+          (ambiguous.into(), crate::DescriptionEnd::Ragged),
+          "{ambiguous}"
         );
-        assert_ne!(last, Some(char::REPLACEMENT_CHARACTER), "{written}");
-        assert!(
-          !(last.is_some_and(is_cjk_letter) && before.is_some_and(|c| !is_cjk_letter(c))),
-          "{written} kept a stray: {description:?}"
-        );
+      }
+    }
+
+    /// LAW (Codex R1): settling is idempotent — a settled description
+    /// parsed again with the same account settles to itself, and parsed
+    /// without one is kept as it stands.
+    #[test]
+    fn settling_is_idempotent() {
+      let cutting = ImageAnalysisTask::new().with_sentence_cut_back(true);
+      for written in AT_THE_CAP {
+        for end in [
+          FieldEnd::MODEL,
+          FieldEnd::CAP,
+          FieldEnd::CAP.with_last_token_cut(true),
+        ] {
+          for task in [capped_at(written), cutting.clone()] {
+            let task = task.with_description_max_chars(nz(written.chars().count()));
+            let once = settled(&task, written, Some(end));
+            let twice = settled(&task, &once.0, Some(end));
+            assert_eq!(twice, once, "{written} under {end:?}");
+            assert_eq!(settled(&task, &once.0, None).0, once.0, "{written}");
+          }
+        }
       }
     }
 

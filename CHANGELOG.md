@@ -2,12 +2,21 @@
 
 ## [Unreleased]
 
+The next release is 0.5.0: `ImageAnalysis` changes its serialized layout.
+
+### Changed
+- **Breaking:** `ImageAnalysis` gains `description_end` as its last field,
+  defaulting to `Unknown`. With the `serde` feature it is serialized last,
+  after the ten fields in the places 0.4.x wrote them. A self-describing
+  0.4.x payload (JSON) still reads, its end `unknown`; a 0.4.x payload in a
+  positional format (bincode) does not.
+
 ### Added
 - `DescriptionEnd` (`Unknown`, the default; `Whole`; `Ragged`;
   `#[non_exhaustive]`) and `ImageAnalysis::description_end` with its
   `with_` / `set_` pair: how the description ends. The `serde` shape gains
-  the `description_end` key (snake-case names), read as `unknown` when a
-  document has none. `with_description` / `set_description` reset it to
+  the `description_end` key, last (snake-case names), read as `unknown`
+  when a document has none. `with_description` / `set_description` reset it to
   `Unknown` — clearing included — since the old text's ending says
   nothing about the new one; a caller with the decoder's account sets it
   afterwards.

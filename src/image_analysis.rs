@@ -48,13 +48,19 @@ use std::vec::Vec;
 /// A field the producing task did not ask for reads empty: the canonical
 /// `ImageAnalysisTask` asks for `description` and `tags` by default, and
 /// for each other field only when that field's extension is switched on.
+///
+/// With the `serde` feature the fields serialize in the order declared,
+/// [`description_end`](Self::description_end) last, after the ten fields
+/// 0.4.x wrote. A self-describing document written before it existed (JSON
+/// from 0.4.x) reads it as [`DescriptionEnd::Unknown`], the honest value
+/// for a description no decoder's account settled. A positional format
+/// (bincode) cannot tell an absent field from a present one, so a 0.4.x
+/// payload in one does not read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageAnalysis {
   scene: SmolStr,
   description: SmolStr,
-  #[cfg_attr(feature = "serde", serde(default))]
-  description_end: DescriptionEnd,
   subjects: Vec<SmolStr>,
   objects: Vec<SmolStr>,
   actions: Vec<SmolStr>,
@@ -63,6 +69,9 @@ pub struct ImageAnalysis {
   lighting: Vec<SmolStr>,
   tags: Vec<SmolStr>,
   categories: Vec<SmolStr>,
+  // Last, so the ten fields 0.4.x wrote keep their places.
+  #[cfg_attr(feature = "serde", serde(default))]
+  description_end: DescriptionEnd,
 }
 
 impl ImageAnalysis {
@@ -434,28 +443,43 @@ mod tests {
     );
   }
 
-  /// A document written before `description_end` existed reads as an
-  /// unknown end, and a ragged one round-trips by its snake-case name.
+  /// LAW (Codex R4, [high]): **a document 0.4.1 wrote reads, its end
+  /// unknown.** The JSON below is the shape 0.4.1 serializes, its ten keys
+  /// in their order and no `description_end`: it reads every field as
+  /// written and the mark as [`DescriptionEnd::Unknown`].
   #[cfg(all(feature = "serde", feature = "json"))]
   #[test]
-  fn description_end_reads_unknown_when_absent_and_round_trips() {
-    let mut older = serde_json::to_value(ImageAnalysis::new().with_description("A cat sleeps."))
-      .expect("an analysis serializes");
-    older
-      .as_object_mut()
-      .expect("an analysis is an object")
-      .remove("description_end")
-      .expect("it carries the key");
-    let older: ImageAnalysis = serde_json::from_value(older).expect("an older document reads");
-    assert_eq!(older.description_end(), DescriptionEnd::Unknown);
+  fn a_document_0_4_1_wrote_reads_with_its_end_unknown() {
+    let written_by_0_4_1 = r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":["rug"],"actions":["sleeping"],"emotion":["calm"],"shot_type":"wide","lighting":["soft"],"tags":["cat","rug"],"categories":["animal"]}"#;
+    let read: ImageAnalysis =
+      serde_json::from_str(written_by_0_4_1).expect("a 0.4.1 document reads");
+    assert_eq!(read.description_end(), DescriptionEnd::Unknown);
+    assert_eq!(read.description(), "A cat sleeps on a");
+    assert_eq!(read.scene(), "kitchen");
+    assert_eq!(read.subjects(), ["cat"]);
+    assert_eq!(read.shot_type(), "wide");
+    assert_eq!(read.categories(), ["animal"]);
+  }
 
+  /// LAW (Codex R4, [high]): **the mark is written last, after the ten
+  /// fields in the places 0.4.x wrote them, and round-trips by its
+  /// snake-case name.** A positional format reads fields by place, so the
+  /// mark between `description` and `subjects` would present a 0.4.x
+  /// payload's `subjects` where the mark is read; the order is asserted on
+  /// the JSON written, key for key.
+  #[cfg(all(feature = "serde", feature = "json"))]
+  #[test]
+  fn the_description_end_is_written_last_and_round_trips() {
     let ragged = ImageAnalysis::new()
+      .with_scene("kitchen")
       .with_description("A cat sleeps on a")
-      .with_description_end(DescriptionEnd::Ragged);
+      .with_description_end(DescriptionEnd::Ragged)
+      .with_subjects(vec!["cat".into()])
+      .with_tags(vec!["cat".into(), "rug".into()]);
     let written = serde_json::to_string(&ragged).expect("an analysis serializes");
-    assert!(
-      written.contains(r#""description_end":"ragged""#),
-      "{written}"
+    assert_eq!(
+      written,
+      r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":[],"actions":[],"emotion":[],"shot_type":"","lighting":[],"tags":["cat","rug"],"categories":[],"description_end":"ragged"}"#
     );
     let read: ImageAnalysis = serde_json::from_str(&written).expect("it reads back");
     assert_eq!(read, ragged);

@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-The next release is 0.5.0: `ImageAnalysis` changes its serialized layout.
+## [0.5.0] - 2026-10-08
+
+`ImageAnalysis` changes its serialized layout.
 
 ### Changed
 - **Breaking:** `ImageAnalysis` gains `description_end` as its last field,

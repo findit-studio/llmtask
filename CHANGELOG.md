@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- `Task::field_caps()` and `FieldCaps` (findit-studio/application#235): the
+  `maxLength` a task's grammar puts on each of the answer's top-level string
+  fields, in Unicode scalar values, by field name. An engine reads the
+  decoder's account of how it ended a field against the cap the task declares:
+  a field that closed holding exactly its declared cap was bound by it,
+  whichever token carried the quote, and is `FieldEnd::cap`. The engine reads
+  no cap out of the grammar; the task that wrote it is the one authority on
+  its caps. The method is provided and declares none, so no existing
+  implementation changes; a task that caps a string but does not declare the
+  cap gets no `cap` account for that field (a string the model closed is
+  still `model`). `FieldCaps` has `new` / `insert` / `get` / `iter` / `len` /
+  `is_empty`, `Default`, `Clone`, `Debug`, `PartialEq`, `Eq`, and a root
+  re-export (`llmtask::FieldCaps`). `ImageAnalysisTask` declares its
+  description's cap, `description_max_chars`, exactly as its schema states it.
+
 ## [0.5.1] - 2026-10-08
 
 ### Added

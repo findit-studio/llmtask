@@ -1,7 +1,8 @@
 //! `Task` trait and parse-error types — the cross-engine
 //! abstraction — and a constrained decoder's account of how it ended
 //! an answer's string fields ([`FieldEnd`], [`FieldEnds`]), which an
-//! engine hands a task through [`Task::parse_ended`].
+//! engine hands a task through [`Task::parse_ended`], read against the
+//! caps the task declares ([`FieldCaps`], [`Task::field_caps`]).
 //!
 //! `Task::ParseError` is an associated type so the trait does not
 //! bake in any concrete error representation. Tasks that parse
@@ -51,13 +52,17 @@ use crate::grammar::Grammar;
 ///   typed parse step.
 /// - `prompt(&self) -> &str` — the user-message prompt.
 ///
-/// # Provided method
+/// # Provided methods
 ///
 /// - `parse_ended(&self, raw: &str, ends: &FieldEnds) -> Result<Self::Output, Self::ParseError>` —
 ///   the parse step with a constrained decoder's account of how it
 ///   ended each string field. The default ignores the accounts and
 ///   returns [`Task::parse`]'s result; a task that settles a capped
 ///   field by its account overrides it.
+/// - `field_caps(&self) -> FieldCaps` — the `maxLength` the task's
+///   grammar puts on each top-level string field, which an engine reads
+///   those accounts against. The default declares none; a task that
+///   settles a capped field by its account declares that field's cap.
 ///
 /// Tasks that parse JSON output typically set
 /// `type ParseError = llmtask::JsonParseError;` (the convenience
@@ -152,6 +157,26 @@ pub trait Task {
   fn parse_ended(&self, raw: &str, ends: &FieldEnds) -> Result<Self::Output, Self::ParseError> {
     let _ = ends;
     self.parse(raw)
+  }
+
+  /// The `maxLength` this task's grammar puts on each of the answer's
+  /// top-level string fields, in Unicode scalar values, by field name.
+  ///
+  /// An engine reads the account of how it ended a field against the cap
+  /// declared here: a field that closed holding exactly its declared cap was
+  /// bound by it, whichever token carried the closing quote, and its account
+  /// is [`FieldEnd::cap`]. The engine reads no cap out of the grammar: the
+  /// task that wrote the grammar is the one authority on its caps.
+  ///
+  /// **A task that caps a string field in its grammar but does not declare
+  /// the cap here gets no `cap` account for that field.** A string the model
+  /// closed is still [`FieldEnd::model`], and one the grammar closed at the
+  /// cap has no account at all. A task that settles a capped field by its
+  /// account declares that field's cap, exactly as its grammar states it.
+  ///
+  /// The default declares none.
+  fn field_caps(&self) -> FieldCaps {
+    FieldCaps::new()
   }
 }
 
@@ -336,6 +361,77 @@ impl FieldEnds {
 }
 
 impl Default for FieldEnds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// The `maxLength` a task's grammar puts on each of the answer's top-level
+/// string fields, in Unicode scalar values (what JSON Schema's `maxLength`
+/// counts): what [`Task::field_caps`] declares.
+///
+/// A field is named as [`FieldEnds`] names it: by its key in the answer's
+/// top-level JSON object, JSON-decoded (`"description"`). A field with no
+/// entry declares no cap.
+///
+/// ```
+/// use llmtask::FieldCaps;
+///
+/// let mut caps = FieldCaps::new();
+/// assert!(caps.is_empty());
+/// caps.insert("description", 120);
+/// assert_eq!(caps.get("description"), Some(120));
+/// assert_eq!(caps.get("scene"), None);
+/// assert_eq!(caps.len(), 1);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldCaps {
+  caps: BTreeMap<SmolStr, usize>,
+}
+
+impl FieldCaps {
+  /// No caps.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      caps: BTreeMap::new(),
+    }
+  }
+
+  /// Declares `cap` as the `maxLength` of `field`, returning the cap it
+  /// replaces, if `field` had one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn insert(&mut self, field: impl Into<SmolStr>, cap: usize) -> Option<usize> {
+    self.caps.insert(field.into(), cap)
+  }
+
+  /// The cap declared for `field`, if any.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn get(&self, field: &str) -> Option<usize> {
+    self.caps.get(field).copied()
+  }
+
+  /// Every declared cap, in field-name order.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn iter(&self) -> impl Iterator<Item = (&str, usize)> {
+    self.caps.iter().map(|(field, cap)| (field.as_str(), *cap))
+  }
+
+  /// How many fields declare a cap.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn len(&self) -> usize {
+    self.caps.len()
+  }
+
+  /// Whether no field declares a cap.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn is_empty(&self) -> bool {
+    self.caps.is_empty()
+  }
+}
+
+impl Default for FieldCaps {
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn default() -> Self {
     Self::new()
@@ -697,6 +793,41 @@ mod field_ends_tests {
         assert_eq!(task.parse_ended(raw, ends), task.parse(raw), "{raw:?}");
       }
     }
+  }
+
+  /// LAW: **the provided `field_caps` declares no cap.**
+  #[test]
+  fn the_default_field_caps_declares_none() {
+    let task = Measure {
+      grammar: SmolStr::new("start: /.*/"),
+    };
+    assert!(task.field_caps().is_empty());
+    assert_eq!(task.field_caps(), FieldCaps::default());
+  }
+
+  /// LAW: **`FieldCaps` maps a field's name to its one cap.** It starts
+  /// empty (`new` is `default`); `insert` declares a cap and hands back the
+  /// one it replaces; `get` reads a field by its exact name; `iter` walks the
+  /// fields in name order.
+  #[test]
+  fn field_caps_maps_a_field_to_its_cap() {
+    let mut caps = FieldCaps::new();
+    assert_eq!(caps, FieldCaps::default());
+    assert!(caps.is_empty());
+    assert_eq!(caps.insert("description", 120), None);
+    assert_eq!(caps.insert("scene", 0), None);
+    assert_eq!(
+      caps.insert("description", 80),
+      Some(120),
+      "the replaced cap"
+    );
+    assert_eq!(caps.len(), 2);
+    assert_eq!(caps.get("description"), Some(80));
+    assert_eq!(caps.get("Description"), None, "names are exact");
+    let fields: Vec<(&str, usize)> = caps.iter().collect();
+    assert_eq!(fields, [("description", 80), ("scene", 0)]);
+    let copy = caps.clone();
+    assert_eq!(copy, caps);
   }
 
   /// LAW: **`FieldEnds` maps a field's name to its one account.** It starts

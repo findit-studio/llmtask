@@ -534,7 +534,7 @@ mod image_analysis_task {
   use super::{DescriptionEnd, ImageAnalysis};
   use crate::{
     grammar::Grammar,
-    task::{FieldEnd, FieldEnds, JsonParseError, Task},
+    task::{FieldCaps, FieldEnd, FieldEnds, JsonParseError, Task},
   };
 
   /// The prompt's opening, before one paragraph per field the task asks
@@ -1467,6 +1467,16 @@ Rules:
     /// holds a description account, else as [`Task::parse`].
     fn parse_ended(&self, raw: &str, ends: &FieldEnds) -> Result<Self::Output, JsonParseError> {
       self.parse_answer(raw, ends.get(Field::Description.key()))
+    }
+
+    /// The description's cap, [`ImageAnalysisTask::description_max_chars`]
+    /// — the `maxLength` the schema states for it — so an engine reads the
+    /// description's account against the cap the task settles it by. No
+    /// other field is capped in characters (`tags` caps its items).
+    fn field_caps(&self) -> FieldCaps {
+      let mut caps = FieldCaps::new();
+      caps.insert(Field::Description.key(), self.description_max_chars.get());
+      caps
     }
   }
 
@@ -4310,6 +4320,27 @@ Rules:
         direct,
         "beside the description's account"
       );
+    }
+
+    /// LAW: **the task declares the description's cap exactly as its schema
+    /// states it, and no other field's**, whatever the cap and the roster.
+    #[test]
+    fn the_task_declares_the_description_cap_its_schema_states() {
+      for cap in [1, 7, 120, 500] {
+        for task in [
+          ImageAnalysisTask::new().with_description_max_chars(nz(cap)),
+          full_task().with_description_max_chars(nz(cap)),
+        ] {
+          let caps = task.field_caps();
+          assert_eq!(caps.len(), 1, "{cap}");
+          assert_eq!(caps.get("description"), Some(cap));
+          assert_eq!(
+            task.schema()["properties"]["description"]["maxLength"],
+            cap,
+            "the declared cap is the schema's"
+          );
+        }
+      }
     }
 
     /// LAW: an answer that is not JSON is `Json` before any other refusal.

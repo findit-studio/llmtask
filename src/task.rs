@@ -1,11 +1,19 @@
 //! `Task` trait and parse-error types — the cross-engine
-//! abstraction.
+//! abstraction — and a constrained decoder's account of how it ended
+//! an answer's string fields ([`FieldEnd`], [`FieldEnds`]), which an
+//! engine hands a task through [`Task::parse_ended`].
 //!
 //! `Task::ParseError` is an associated type so the trait does not
 //! bake in any concrete error representation. Tasks that parse
 //! JSON output use [`crate::JsonParseError`] (gated on the `json`
 //! feature); Tasks that parse free-form text or custom formats
 //! choose their own error type.
+
+use smol_str::SmolStr;
+// `BTreeMap` under both std (resolves via the `extern crate std`) and
+// alloc-only (resolves via the `extern crate alloc as std` alias in
+// lib.rs).
+use std::collections::BTreeMap;
 
 use crate::grammar::Grammar;
 
@@ -29,10 +37,9 @@ use crate::grammar::Grammar;
 ///
 /// # Required methods
 ///
-/// Implementors provide all four method signatures explicitly —
-/// there are no default implementations. The trait used to expose
-/// only `schema(&self) -> &serde_json::Value` and a fixed
-/// `ParseError` enum, but both have been generalized:
+/// Implementors provide these four methods explicitly. The trait
+/// used to expose only `schema(&self) -> &serde_json::Value` and a
+/// fixed `ParseError` enum, but both have been generalized:
 ///
 /// - `schema(&self) -> &Self::Value` — borrow the typed schema
 ///   (engines that bind `Value = serde_json::Value` get typed
@@ -43,6 +50,14 @@ use crate::grammar::Grammar;
 /// - `parse(&self, raw: &str) -> Result<Self::Output, Self::ParseError>` —
 ///   typed parse step.
 /// - `prompt(&self) -> &str` — the user-message prompt.
+///
+/// # Provided method
+///
+/// - `parse_ended(&self, raw: &str, ends: &FieldEnds) -> Result<Self::Output, Self::ParseError>` —
+///   the parse step with a constrained decoder's account of how it
+///   ended each string field. The default ignores the accounts and
+///   returns [`Task::parse`]'s result; a task that settles a capped
+///   field by its account overrides it.
 ///
 /// Tasks that parse JSON output typically set
 /// `type ParseError = llmtask::JsonParseError;` (the convenience
@@ -114,6 +129,217 @@ pub trait Task {
 
   /// Parse the model's raw text output into a typed `Output`.
   fn parse(&self, raw: &str) -> Result<Self::Output, Self::ParseError>;
+
+  /// [`Task::parse`], with a constrained decoder's account of how it
+  /// ended the answer's string fields.
+  ///
+  /// An engine that decodes under the task's grammar knows, at the step
+  /// it closes a string field, whether the model closed it or the grammar
+  /// closed it at the field's `maxLength`; the answer's text does not
+  /// carry that. Such an engine calls this in place of [`Task::parse`],
+  /// handing over in `ends` an account of every string field it took one
+  /// for. A task reads the accounts of the fields it caps and ignores the
+  /// rest; a field with no account is parsed as [`Task::parse`] parses it.
+  ///
+  /// The default ignores `ends` and returns [`Task::parse`]'s result, so
+  /// an engine can call this on every task, and a task that reads no
+  /// account needs no override.
+  ///
+  /// # Errors
+  ///
+  /// As [`Task::parse`]; an override may also refuse an account that
+  /// contradicts the field it describes.
+  fn parse_ended(&self, raw: &str, ends: &FieldEnds) -> Result<Self::Output, Self::ParseError> {
+    let _ = ends;
+    self.parse(raw)
+  }
+}
+
+// ===== the decoder's account of how it ended a string field =====
+
+/// How a constrained decoder ended one string field of an answer. An
+/// engine that decodes under the task's grammar knows it at the step it
+/// closes the string; the answer's text does not carry it. The engine
+/// hands a task its accounts, keyed by field ([`FieldEnds`]), through
+/// [`Task::parse_ended`]; `image_analysis::ImageAnalysisTask` settles its
+/// description by one, which `parse_with_description_end` also takes
+/// directly.
+///
+/// # One string
+///
+/// Every account is about ONE string: the field exactly as the answer
+/// carries it — JSON-decoded, untrimmed — which it holds whole
+/// ([`Self::source`]) and is bound to byte for byte. A field that is not
+/// exactly that string is not one the account describes, and nothing is
+/// known about how it ends: a settled field, shorter by a suffix or by its
+/// trimming; another string of the same length; an account left from a
+/// retry, or taken for another answer in a batch. `ImageAnalysisTask`
+/// removes nothing from such a description and marks it
+/// [`DescriptionEnd::Unknown`](crate::DescriptionEnd::Unknown).
+///
+/// # What an engine reports
+///
+/// Whether the model closed the string ([`Self::model`]) or the grammar
+/// closed it at its `maxLength` ([`Self::cap`]); and, when the string's
+/// last token was cut — its bytes an incomplete sequence the detokenizer
+/// decoded as U+FFFD — that token's text ([`Self::with_cut`]). The account
+/// names the suffix by its BYTES, never by a position: a position moves
+/// when the text is trimmed. A flag saying only *that* a token was cut is
+/// not an account of which bytes: with none, nothing is removed.
+///
+/// # A cap's invariant
+///
+/// The grammar closes a string exactly at its cap, so the string a cap's
+/// account describes holds exactly as many characters (Unicode scalar
+/// values, as JSON Schema's `maxLength` counts them) as the field's cap.
+/// One that does not was taken under another cap: the account and the task
+/// disagree, a configuration skew a task refuses by name rather than
+/// settles — `ImageAnalysisTask` as
+/// `JsonParseError::DescriptionCapMismatch`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldEnd {
+  closed_at_cap: bool,
+  source: SmolStr,
+  cut: Option<SmolStr>,
+}
+
+impl FieldEnd {
+  /// The model closed `field` itself: the grammar would have let it go
+  /// on. `field` is the string exactly as the answer carries it —
+  /// JSON-decoded, untrimmed.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn model(field: &str) -> Self {
+    Self {
+      closed_at_cap: false,
+      source: SmolStr::new(field),
+      cut: None,
+    }
+  }
+
+  /// The grammar closed `field` at its `maxLength`: the model was left no
+  /// choice but to end it there. `field` is the string exactly as the
+  /// answer carries it — JSON-decoded, untrimmed — and holds exactly the
+  /// cap's characters; only a capped string carries this account.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn cap(field: &str) -> Self {
+    Self {
+      closed_at_cap: true,
+      source: SmolStr::new(field),
+      cut: None,
+    }
+  }
+
+  /// Whether the grammar closed the string at the field's `maxLength`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn closed_at_cap(&self) -> bool {
+    self.closed_at_cap
+  }
+
+  /// The one string this account describes, exactly as the answer
+  /// carries it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn source(&self) -> &str {
+    &self.source
+  }
+
+  /// The cut last token's text, when the decoder named one — see
+  /// [`Self::with_cut`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn cut(&self) -> Option<&str> {
+    self.cut.as_deref()
+  }
+
+  /// Builder-style setter for [`Self::cut`]: the last token of the
+  /// account's string was cut, and `suffix` is its text, exactly as the
+  /// string ends with it — the detokenizer's U+FFFD included.
+  ///
+  /// A field that is the account's string, closed at the cap, loses
+  /// exactly those bytes, and only when it ends with them and keeps text
+  /// before them; anything else (a suffix the text does not end with, an
+  /// empty one, one that is the whole text) removes nothing and keeps the
+  /// trimmed text. Only the grammar's close cuts a token, so a
+  /// [`Self::model`] account ignores it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_cut(mut self, suffix: &str) -> Self {
+    self.cut = Some(SmolStr::new(suffix));
+    self
+  }
+}
+
+/// A constrained decoder's accounts of how it ended an answer's string
+/// fields, one [`FieldEnd`] per field: what an engine hands
+/// [`Task::parse_ended`].
+///
+/// A field is named by its key in the answer's top-level JSON object,
+/// JSON-decoded (`"description"`). A field with no entry has no account:
+/// how it ended is unknown.
+///
+/// ```
+/// use llmtask::{FieldEnd, FieldEnds};
+///
+/// let mut ends = FieldEnds::new();
+/// assert!(ends.is_empty());
+/// ends.insert("description", FieldEnd::cap("A cat sleeps on a"));
+/// ends.insert("scene", FieldEnd::model("kitchen"));
+/// assert_eq!(ends.len(), 2);
+/// assert!(ends.get("description").is_some_and(FieldEnd::closed_at_cap));
+/// assert!(ends.get("tags").is_none());
+/// // In field-name order.
+/// let fields: Vec<&str> = ends.iter().map(|(field, _)| field).collect();
+/// assert_eq!(fields, ["description", "scene"]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldEnds {
+  ends: BTreeMap<SmolStr, FieldEnd>,
+}
+
+impl FieldEnds {
+  /// No accounts.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      ends: BTreeMap::new(),
+    }
+  }
+
+  /// Records `end` as the account of `field`, returning the account it
+  /// replaces, if `field` had one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn insert(&mut self, field: impl Into<SmolStr>, end: FieldEnd) -> Option<FieldEnd> {
+    self.ends.insert(field.into(), end)
+  }
+
+  /// The account of `field`, if it has one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn get(&self, field: &str) -> Option<&FieldEnd> {
+    self.ends.get(field)
+  }
+
+  /// Every field's account, in field-name order.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn iter(&self) -> impl Iterator<Item = (&str, &FieldEnd)> {
+    self.ends.iter().map(|(field, end)| (field.as_str(), end))
+  }
+
+  /// How many fields have an account.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn len(&self) -> usize {
+    self.ends.len()
+  }
+
+  /// Whether no field has an account.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn is_empty(&self) -> bool {
+    self.ends.is_empty()
+  }
+}
+
+impl Default for FieldEnds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 // ===== JSON parse error (json feature only) =====
@@ -401,5 +627,115 @@ mod tests {
     }
     let v = json_only_engine(&X);
     assert_eq!(v, &serde_json::json!({"type": "object"}));
+  }
+}
+
+// Nothing here needs std or JSON, so these run under every feature set
+// that compiles this module, `alloc` alone included.
+#[cfg(test)]
+mod field_ends_tests {
+  use super::*;
+  use std::vec::Vec;
+
+  /// A Lark task that parses any non-empty answer to its length in bytes.
+  struct Measure {
+    grammar: SmolStr,
+  }
+
+  /// [`Measure`]'s refusal of an empty answer.
+  #[derive(Debug, PartialEq, Eq)]
+  struct EmptyAnswer;
+
+  impl core::fmt::Display for EmptyAnswer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.write_str("the answer is empty")
+    }
+  }
+
+  impl core::error::Error for EmptyAnswer {}
+
+  impl Task for Measure {
+    type Output = usize;
+    type Value = SmolStr;
+    type ParseError = EmptyAnswer;
+    fn prompt(&self) -> &str {
+      "Answer with any text."
+    }
+    fn schema(&self) -> &SmolStr {
+      &self.grammar
+    }
+    fn grammar(&self) -> Grammar {
+      Grammar::lark(self.grammar.clone())
+    }
+    fn parse(&self, raw: &str) -> Result<usize, EmptyAnswer> {
+      if raw.is_empty() {
+        Err(EmptyAnswer)
+      } else {
+        Ok(raw.len())
+      }
+    }
+  }
+
+  /// LAW: **the provided `parse_ended` is `parse`**, whatever accounts it
+  /// is handed — none, or accounts of fields the answer does and does not
+  /// carry — on an answer `parse` holds and on one it refuses.
+  #[test]
+  fn the_default_parse_ended_is_parse() {
+    let task = Measure {
+      grammar: SmolStr::new("start: /.*/"),
+    };
+    let mut ends = FieldEnds::new();
+    let none = ends.clone();
+    ends.insert("description", FieldEnd::cap("A cat sleeps on a"));
+    ends.insert("scene", FieldEnd::model("kitchen").with_cut("n"));
+    for raw in [
+      "",
+      "A cat sleeps on a",
+      r#"{"description":"A cat sleeps on a","scene":"kitchen"}"#,
+    ] {
+      for ends in [&none, &ends] {
+        assert_eq!(task.parse_ended(raw, ends), task.parse(raw), "{raw:?}");
+      }
+    }
+  }
+
+  /// LAW: **`FieldEnds` maps a field's name to its one account.** It starts
+  /// empty (`new` is `default`); `insert` records an account and hands back
+  /// the one it replaces; `get` reads a field by its exact name; `iter`
+  /// walks the fields in name order; two maps are equal when every field's
+  /// account is.
+  #[test]
+  fn field_ends_maps_a_field_to_its_account() {
+    let mut ends = FieldEnds::new();
+    assert_eq!(ends, FieldEnds::default());
+    assert!(ends.is_empty());
+    assert_eq!(ends.len(), 0);
+    assert!(ends.iter().next().is_none());
+
+    let capped = FieldEnd::cap("A cat sleeps on a");
+    let closed = FieldEnd::model("A cat sleeps.");
+    assert_eq!(ends.insert("description", capped.clone()), None);
+    assert_eq!(ends.insert("scene", FieldEnd::model("kitchen")), None);
+    assert_eq!(
+      ends.insert("description", closed.clone()),
+      Some(capped),
+      "the replaced account is handed back"
+    );
+    assert_eq!(ends.len(), 2);
+    assert!(!ends.is_empty());
+    assert_eq!(ends.get("description"), Some(&closed));
+    assert_eq!(ends.get("Description"), None, "names are exact");
+    assert_eq!(ends.get("tags"), None);
+    let fields: Vec<(&str, bool)> = ends
+      .iter()
+      .map(|(field, end)| (field, end.closed_at_cap()))
+      .collect();
+    assert_eq!(fields, [("description", false), ("scene", false)]);
+
+    let copy = ends.clone();
+    assert_eq!(copy, ends);
+    let mut other = copy;
+    other.insert("scene", FieldEnd::cap("kitchen"));
+    assert_ne!(other, ends, "one field's account differs");
   }
 }

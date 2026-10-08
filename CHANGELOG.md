@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+- `Task::parse_ended(raw, &FieldEnds)` and `FieldEnds`
+  (findit-studio/application#235): the door through which an engine generic
+  over `Task` hands a task its constrained decoder's account of how it ended
+  each string field of the answer. `FieldEnds` maps a field, named by its key
+  in the answer's top-level object (`"description"`), to its `FieldEnd`
+  (`new` / `insert` / `get` / `iter` / `len` / `is_empty`; `Default`, `Clone`,
+  `Debug`, `PartialEq`, `Eq`). The method is provided: its default ignores the
+  accounts and returns `Task::parse`'s result, so an engine can call it on any
+  task and no existing implementation changes. `ImageAnalysisTask` overrides
+  it: the `"description"` account settles the description exactly as
+  `parse_with_description_end` does, and an account of any other field is
+  ignored.
+- `FieldEnd` and `FieldEnds` at the crate root (`llmtask::FieldEnd`,
+  `llmtask::FieldEnds`), beside the `Task` that names them. `FieldEnd` now
+  needs only `alloc`; `llmtask::image_analysis::FieldEnd` names the same type
+  as before.
+
 ## [0.5.0] - 2026-10-08
 
 `ImageAnalysis` changes its serialized layout.

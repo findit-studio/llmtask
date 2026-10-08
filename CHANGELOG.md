@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-08
+
 ### Added
 - `Task::field_caps()` and `FieldCaps` (findit-studio/application#235): the
   `maxLength` a task's grammar puts on each of the answer's top-level string

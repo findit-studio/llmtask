@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-08
+
 ### Added
 - `Task::parse_ended(raw, &FieldEnds)` and `FieldEnds`
   (findit-studio/application#235): the door through which an engine generic

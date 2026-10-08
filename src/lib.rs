@@ -28,7 +28,7 @@ pub use grammar::{Grammar, UnsupportedGrammar};
 pub use image_analysis::{DescriptionEnd, ImageAnalysis};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-pub use task::Task;
+pub use task::{FieldEnd, FieldEnds, Task};
 
 /// JSON parse error convenience type for Tasks whose model output
 /// is JSON. Behind the `json` feature (default-on).

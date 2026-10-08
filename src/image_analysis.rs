@@ -28,6 +28,11 @@ use smol_str::SmolStr;
 // `extern crate alloc as std` alias in lib.rs).
 use std::vec::Vec;
 
+// The account a description is settled by. It is defined beside the
+// `Task::parse_ended` door that hands it to any task, and stays nameable
+// here, beside the `DescriptionEnd` it settles.
+pub use crate::task::FieldEnd;
+
 /// Structured single-image VLM output. Construct via an engine's
 /// `ImageAnalysisTask::parse` (the `Task::parse` impl) or, for
 /// tests/builders, [`ImageAnalysis::new`]
@@ -351,7 +356,8 @@ impl ImageAnalysis {
 /// `…facing forward with a neutral,略`). Only the decoder knows whether it
 /// closed a string or the model did: an answer that ends exactly at the
 /// cap reads the same either way. So this fact comes from the engine's
-/// account ([`FieldEnd`], handed to
+/// account ([`FieldEnd`], handed to `ImageAnalysisTask` through
+/// [`Task::parse_ended`](crate::Task::parse_ended) or
 /// `ImageAnalysisTask::parse_with_description_end`), and without one it
 /// is [`Unknown`](Self::Unknown) and the text is kept as written.
 ///
@@ -501,7 +507,7 @@ mod tests {
 
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-pub use image_analysis_task::{Extension, FieldEnd, ImageAnalysisTask, UnknownExtension};
+pub use image_analysis_task::{Extension, ImageAnalysisTask, UnknownExtension};
 
 /// The `ImageAnalysisTask` implementation. Grouped in its own private
 /// module (mirroring `task::json`'s pattern) so the whole surface —
@@ -528,7 +534,7 @@ mod image_analysis_task {
   use super::{DescriptionEnd, ImageAnalysis};
   use crate::{
     grammar::Grammar,
-    task::{JsonParseError, Task},
+    task::{FieldEnd, FieldEnds, JsonParseError, Task},
   };
 
   /// The prompt's opening, before one paragraph per field the task asks
@@ -1177,114 +1183,7 @@ Rules:
       raw: &str,
       end: &FieldEnd,
     ) -> Result<ImageAnalysis, JsonParseError> {
-      self.parse_ended(raw, Some(end))
-    }
-  }
-
-  /// How a constrained decoder ended one string field of an answer — the
-  /// account [`ImageAnalysisTask::parse_with_description_end`] settles the
-  /// description by. An engine that decodes under the task's grammar
-  /// knows it at the step it closes the string; the answer's text does
-  /// not carry it.
-  ///
-  /// # One string
-  ///
-  /// Every account is about ONE string: the field exactly as the answer
-  /// carries it — JSON-decoded, untrimmed — which it holds whole
-  /// ([`Self::source`]) and is bound to byte for byte. A description that is
-  /// not exactly that string is not one the account describes, and nothing
-  /// is known about how it ends: nothing is removed from it, and it is
-  /// [`DescriptionEnd::Unknown`] — a settled description, shorter by a
-  /// suffix or by its trimming; another description of the same length; an
-  /// account left from a retry, or taken for another answer in a batch.
-  ///
-  /// # What an engine reports
-  ///
-  /// Whether the model closed the string ([`Self::model`]) or the grammar
-  /// closed it at its `maxLength` ([`Self::cap`]); and, when the string's
-  /// last token was cut — its bytes an incomplete sequence the detokenizer
-  /// decoded as U+FFFD — that token's text ([`Self::with_cut`]). The account
-  /// names the suffix by its BYTES, never by a position: a position moves
-  /// when the text is trimmed. A flag saying only *that* a token was cut is
-  /// not an account of which bytes: with none, nothing is removed.
-  ///
-  /// # A cap's invariant
-  ///
-  /// The grammar closes a string exactly at its cap, so the string a cap's
-  /// account describes holds exactly as many characters (Unicode scalar
-  /// values, as the schema counts them) as the task's
-  /// `description_max_chars`. One that does not was taken under another cap:
-  /// the account and the task disagree, a configuration skew that is
-  /// refused by name ([`JsonParseError::DescriptionCapMismatch`]) rather
-  /// than settled.
-  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-  pub struct FieldEnd {
-    closed_at_cap: bool,
-    source: SmolStr,
-    cut: Option<SmolStr>,
-  }
-
-  impl FieldEnd {
-    /// The model closed `field` itself: the grammar would have let it go
-    /// on. `field` is the string exactly as the answer carries it —
-    /// JSON-decoded, untrimmed.
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub fn model(field: &str) -> Self {
-      Self {
-        closed_at_cap: false,
-        source: SmolStr::new(field),
-        cut: None,
-      }
-    }
-
-    /// The grammar closed `field` at its `maxLength`: the model was left no
-    /// choice but to end it there. `field` is the string exactly as the
-    /// answer carries it — JSON-decoded, untrimmed — and holds exactly the
-    /// cap's characters; only a capped string carries this account.
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub fn cap(field: &str) -> Self {
-      Self {
-        closed_at_cap: true,
-        source: SmolStr::new(field),
-        cut: None,
-      }
-    }
-
-    /// Whether the grammar closed the string at the field's `maxLength`.
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub const fn closed_at_cap(&self) -> bool {
-      self.closed_at_cap
-    }
-
-    /// The one string this account describes, exactly as the answer
-    /// carries it.
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub fn source(&self) -> &str {
-      &self.source
-    }
-
-    /// The cut last token's text, when the decoder named one — see
-    /// [`Self::with_cut`].
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    pub fn cut(&self) -> Option<&str> {
-      self.cut.as_deref()
-    }
-
-    /// Builder-style setter for [`Self::cut`]: the last token of the
-    /// account's string was cut, and `suffix` is its text, exactly as the
-    /// string ends with it — the detokenizer's U+FFFD included.
-    ///
-    /// A description that is the account's string, closed at the cap, loses
-    /// exactly those bytes, and only when it ends with them and keeps text
-    /// before them; anything else (a suffix the text does not end with, an
-    /// empty one, one that is the whole text) removes nothing and keeps the
-    /// trimmed text. Only the grammar's close cuts a token, so a
-    /// [`Self::model`] account ignores it.
-    #[cfg_attr(not(tarpaulin), inline(always))]
-    #[must_use]
-    pub fn with_cut(mut self, suffix: &str) -> Self {
-      self.cut = Some(SmolStr::new(suffix));
-      self
+      self.parse_answer(raw, Some(end))
     }
   }
 
@@ -1553,14 +1452,28 @@ Rules:
     }
 
     fn parse(&self, raw: &str) -> Result<Self::Output, JsonParseError> {
-      self.parse_ended(raw, None)
+      self.parse_answer(raw, None)
+    }
+
+    /// [`Task::parse`], with the description settled by its account in
+    /// `ends` — the `"description"` entry — exactly as
+    /// [`ImageAnalysisTask::parse_with_description_end`] settles it; with
+    /// no such entry, as [`Task::parse`]. An account of any other field is
+    /// ignored: the description is the one string the task caps.
+    ///
+    /// # Errors
+    ///
+    /// As [`ImageAnalysisTask::parse_with_description_end`] when `ends`
+    /// holds a description account, else as [`Task::parse`].
+    fn parse_ended(&self, raw: &str, ends: &FieldEnds) -> Result<Self::Output, JsonParseError> {
+      self.parse_answer(raw, ends.get(Field::Description.key()))
     }
   }
 
   impl ImageAnalysisTask {
     /// [`Task::parse`]'s body, with the decoder's account of how it ended
     /// the description when there is one.
-    fn parse_ended(
+    fn parse_answer(
       &self,
       raw: &str,
       description_end: Option<&FieldEnd>,
@@ -3948,14 +3861,18 @@ Rules:
       written: &str,
       end: Option<FieldEnd>,
     ) -> Result<(String, crate::DescriptionEnd), JsonParseError> {
-      let answer =
-        serde_json::to_string(&serde_json::json!({ "description": written, "tags": ["label"] }))
-          .expect("a JSON value serializes");
+      let answer = answer(written);
       let analysis = match end {
         None => task.parse(&answer),
         Some(end) => task.parse_with_description_end(&answer, &end),
       }?;
       Ok((analysis.description().into(), analysis.description_end()))
+    }
+
+    /// The default task's answer whose description is `written`.
+    fn answer(written: &str) -> String {
+      serde_json::to_string(&serde_json::json!({ "description": written, "tags": ["label"] }))
+        .expect("a JSON value serializes")
     }
 
     /// The task whose cap `written` reaches: capped at its length.
@@ -4298,6 +4215,101 @@ Rules:
           "{other:?} under the account of {text:?} less {suffix:?}"
         );
       }
+    }
+
+    /// LAW: **`Task::parse_ended` settles the description by its
+    /// `"description"` account exactly as `parse_with_description_end`
+    /// settles it** — the model's end, the grammar's close at the cap, a
+    /// named cut, and an account taken under another cap, refused by name —
+    /// so an engine generic over `Task` reaches the same settling through the
+    /// trait's door.
+    #[test]
+    fn parse_ended_settles_the_description_as_parse_with_description_end() {
+      for written in AT_THE_CAP {
+        let task = capped_at(written);
+        let answer = answer(written);
+        for end in [
+          FieldEnd::model(written),
+          FieldEnd::cap(written),
+          FieldEnd::cap(written).with_cut(last_char(written)),
+        ] {
+          let mut ends = FieldEnds::new();
+          ends.insert("description", end.clone());
+          let through_the_door = task
+            .parse_ended(&answer, &ends)
+            .unwrap_or_else(|e| panic!("{written:?} under {end:?} must parse: {e:?}"));
+          let direct = task
+            .parse_with_description_end(&answer, &end)
+            .unwrap_or_else(|e| panic!("{written:?} under {end:?} must parse: {e:?}"));
+          assert_eq!(through_the_door, direct, "{written:?} under {end:?}");
+          assert_ne!(
+            through_the_door.description_end(),
+            crate::DescriptionEnd::Unknown,
+            "{written:?}: the account is read"
+          );
+        }
+      }
+      let task = ImageAnalysisTask::new();
+      let answer = answer("abc\u{FFFD}");
+      let end = FieldEnd::cap("abc\u{FFFD}").with_cut("\u{FFFD}");
+      let mut ends = FieldEnds::new();
+      ends.insert("description", end.clone());
+      for refused in [
+        task.parse_ended(&answer, &ends),
+        task.parse_with_description_end(&answer, &end),
+      ] {
+        assert!(
+          matches!(
+            refused,
+            Err(JsonParseError::DescriptionCapMismatch { cap: 120, chars: 4 })
+          ),
+          "an account taken under another cap: {refused:?}"
+        );
+      }
+    }
+
+    /// LAW: **an account of any other field changes nothing.** The
+    /// description is the one string the task caps. With no `"description"`
+    /// entry — no accounts at all, or only accounts of other fields: one the
+    /// task asks for (`tags`), one it does not (`scene`), the description's
+    /// name in another case or spelled as a JSON pointer, the empty name —
+    /// `parse_ended` is `parse`, the description `Unknown`; beside a
+    /// description account they change nothing that account settles.
+    #[test]
+    fn an_account_of_another_field_changes_nothing() {
+      let written = AT_THE_CAP[0];
+      let task = capped_at(written);
+      let answer = answer(written);
+      let parse_ended = |ends: &FieldEnds| {
+        task
+          .parse_ended(&answer, ends)
+          .unwrap_or_else(|e| panic!("{ends:?} must parse: {e:?}"))
+      };
+      let parsed = task.parse(&answer).expect("the answer parses");
+      assert_eq!(parsed.description_end(), crate::DescriptionEnd::Unknown);
+      let mut ends = FieldEnds::new();
+      assert_eq!(parse_ended(&ends), parsed, "no accounts");
+      for (field, end) in [
+        ("tags", FieldEnd::cap("label")),
+        ("scene", FieldEnd::model("kitchen")),
+        ("Description", FieldEnd::cap(written)),
+        ("/description", FieldEnd::model(written)),
+        ("", FieldEnd::cap(written)),
+      ] {
+        ends.insert(field, end);
+        assert_eq!(parse_ended(&ends), parsed, "an account of {field:?}");
+      }
+      let end = FieldEnd::cap(written);
+      ends.insert("description", end.clone());
+      let direct = task
+        .parse_with_description_end(&answer, &end)
+        .expect("the answer parses with the description's account");
+      assert_eq!(direct.description_end(), crate::DescriptionEnd::Ragged);
+      assert_eq!(
+        parse_ended(&ends),
+        direct,
+        "beside the description's account"
+      );
     }
 
     /// LAW: an answer that is not JSON is `Json` before any other refusal.

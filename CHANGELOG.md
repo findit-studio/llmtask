@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-10
+
 `ImageAnalysis` changes its serialized layout, and `ImageAnalysisTask` caps
 every list and reads each to its cap (findit-studio/llmtask#18).
 

@@ -467,7 +467,10 @@ mod json {
     /// The response is not a JSON text: `serde_json` failed to parse it.
     /// `image_analysis::ImageAnalysisTask` also refuses here a string that
     /// escapes one half of a UTF-16 surrogate pair, which serde_json's
-    /// grammar admits but no Unicode text can hold, wherever it sits.
+    /// grammar admits but no Unicode text can hold, wherever it sits; and it
+    /// reads one text that ends too soon instead of refusing it here: an
+    /// answer cut off inside the array of a list it asks for, closed after
+    /// that list's last whole item.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     /// The top-level JSON object declared the same member name more than
@@ -489,7 +492,8 @@ mod json {
     /// field absent or present as JSON `null`, any listed field (required
     /// or optional) present with any JSON type other than the one its
     /// schema entry declares, or a value over a cap its schema entry
-    /// declares (`maxLength`, `maxItems`). Another type means any of them:
+    /// declares (`maxLength`, `maxItems`) that the task holds the field to.
+    /// Another type means any of them:
     /// a number, a boolean or an object; a string where an array of strings
     /// is declared (a comma-separated list included); an array where a
     /// string is declared (a one-element array included); or an array
@@ -502,6 +506,13 @@ mod json {
     /// perspective: the field's value can't be used. A task names such a
     /// field here; it never coerces the value into the declared shape and
     /// never truncates it to fit.
+    ///
+    /// `image_analysis::ImageAnalysisTask` holds its description to its
+    /// `maxLength`, and reads each list — `tags` and the list extensions —
+    /// to its `maxItems` instead, marking the list `Capped`, so a list is
+    /// never named here for its length. An answer it closed after a cut
+    /// inside a list lacks every field the cut left unwritten, and those are
+    /// named here.
     #[error("schema violation: required fields missing, null, or invalid: {0:?}")]
     MissingFields(Vec<&'static str>),
     /// JSON parsed as an object, but it carries one or more keys outside

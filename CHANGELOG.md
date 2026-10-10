@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+`ImageAnalysis` changes its serialized layout, and `ImageAnalysisTask` caps
+every list and reads each to its cap (findit-studio/llmtask#18).
+
+### Changed
+- **Breaking:** `ImageAnalysis` gains seven list ends after
+  `description_end`: `subjects_end`, `objects_end`, `actions_end`,
+  `emotion_end`, `lighting_end`, `tags_end` and `categories_end`, each
+  defaulting to `Unknown`. With the `serde` feature they are serialized in
+  that order, after every field 0.5.x wrote. A self-describing 0.5.x payload
+  (JSON) still reads, its list ends `unknown`; a 0.5.x payload in a
+  positional format (bincode) does not.
+- `ImageAnalysisTask` caps each list extension (findit-studio/llmtask#18).
+  With `categories` on, LFM2.5-VL-450M kept appending labels until the
+  token budget ran out and the answer never closed, while `description` and
+  `tags`, capped since 0.4.0, never looped. Each list extension's schema
+  entry now states `maxItems`, as `tags`' does, so a constrained decoder
+  that honours it (llguidance does) closes the list at its cap: `subjects`,
+  `objects` and `actions` at 8, as `tags`; `emotion`, `lighting` and
+  `categories` at 3. The prompt is unchanged. The schema states no
+  `uniqueItems`: llguidance does not implement it and refuses a schema that
+  uses it, so the labels stay deduplicated by `parse`.
+- **Breaking:** `ImageAnalysisTask::parse` reads every list — `tags` and
+  each list extension — to its cap. `tags` over its cap, which 0.5.x refused
+  as `JsonParseError::MissingFields(["tags"])`, is now read to it; a list
+  extension, which 0.5.x kept whole however long, now keeps its first
+  `max_items` labels. The list is read whole (an element that is not a
+  string still refuses the field by name), keeps its first cap's count of
+  elements as the answer wrote them, and is marked `Capped` when the answer
+  listed at least the cap's count, `Whole` when it closed the list short of
+  it; a list is never refused for its length. `description` keeps its rule:
+  over its `maxLength`, it is refused by name.
+- An answer that is JSON as far as it goes and ends inside the array of a
+  list the task asks for, `tags` or a list extension, is no longer
+  `JsonParseError::Json`. It is read as the answer closed after that list's
+  last whole item (a string item the cut left open is dropped), held to
+  every check any answer is, and the list is `Capped`. It parses when the
+  cut list is the last field the task asks for in the answer, as an engine
+  that writes the schema's members in order writes `categories` when it is
+  asked for and `tags` otherwise; a field the cut left unwritten is
+  `JsonParseError::MissingFields` naming it. A cut anywhere else (in a key,
+  inside or after a string field, after a list's own `]`, inside an item
+  that is not a string, inside a list the task does not ask for) is still
+  `JsonParseError::Json`. An engine that refuses an answer the token budget
+  ran out on before parsing it never reaches this rule; for such an engine,
+  `maxItems` is what ends the loop.
+
+### Added
+- `ListEnd` (`Unknown`, the default; `Whole`; `Capped`; `#[non_exhaustive]`;
+  re-exported as `llmtask::ListEnd`): how one of an `ImageAnalysis`'s lists
+  ends, read from the answer itself. `ImageAnalysis` gains `subjects_end`,
+  `objects_end`, `actions_end`, `emotion_end`, `lighting_end`, `tags_end`
+  and `categories_end`, each with its `with_` / `set_` pair; a list's
+  setters (`with_tags`, `set_categories`, ...) reset its end to `Unknown`,
+  as the description's setters reset `description_end`.
+- `ImageAnalysisTask::max_items(extension)`, `with_max_items(extension, cap)`
+  and `set_max_items(extension, cap)`, which rebuild the schema, and
+  `ImageAnalysisTask::default_max_items(extension)`. `scene` and `shot_type`
+  are strings: their `max_items` is `None`, and setting one changes nothing.
+  `tags` keeps its own cap, `tags_max_items`.
+
 ## [0.5.2] - 2026-10-08
 
 ### Added

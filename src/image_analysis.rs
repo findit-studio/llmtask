@@ -54,13 +54,16 @@ pub use crate::task::FieldEnd;
 /// `ImageAnalysisTask` asks for `description` and `tags` by default, and
 /// for each other field only when that field's extension is switched on.
 ///
-/// With the `serde` feature the fields serialize in the order declared,
-/// [`description_end`](Self::description_end) last, after the ten fields
-/// 0.4.x wrote. A self-describing document written before it existed (JSON
-/// from 0.4.x) reads it as [`DescriptionEnd::Unknown`], the honest value
-/// for a description no decoder's account settled. A positional format
-/// (bincode) cannot tell an absent field from a present one, so a 0.4.x
-/// payload in one does not read.
+/// With the `serde` feature the fields serialize in the order declared: the
+/// ten fields 0.4.x wrote, then [`description_end`](Self::description_end),
+/// then the seven list ends from [`subjects_end`](Self::subjects_end) to
+/// [`categories_end`](Self::categories_end), each mark after every field
+/// written before it existed. A self-describing document written before a
+/// mark existed (JSON from 0.4.x, or from 0.5.x for the list ends) reads it
+/// as unknown ([`DescriptionEnd::Unknown`], [`ListEnd::Unknown`]), the honest
+/// value for an end nothing recorded. A positional format (bincode) cannot
+/// tell an absent field from a present one, so a payload written before a
+/// mark existed does not read in one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageAnalysis {
@@ -74,9 +77,24 @@ pub struct ImageAnalysis {
   lighting: Vec<SmolStr>,
   tags: Vec<SmolStr>,
   categories: Vec<SmolStr>,
-  // Last, so the ten fields 0.4.x wrote keep their places.
+  // After the ten fields 0.4.x wrote, so they keep their places.
   #[cfg_attr(feature = "serde", serde(default))]
   description_end: DescriptionEnd,
+  // After every field 0.5.x wrote, so those keep their places.
+  #[cfg_attr(feature = "serde", serde(default))]
+  subjects_end: ListEnd,
+  #[cfg_attr(feature = "serde", serde(default))]
+  objects_end: ListEnd,
+  #[cfg_attr(feature = "serde", serde(default))]
+  actions_end: ListEnd,
+  #[cfg_attr(feature = "serde", serde(default))]
+  emotion_end: ListEnd,
+  #[cfg_attr(feature = "serde", serde(default))]
+  lighting_end: ListEnd,
+  #[cfg_attr(feature = "serde", serde(default))]
+  tags_end: ListEnd,
+  #[cfg_attr(feature = "serde", serde(default))]
+  categories_end: ListEnd,
 }
 
 impl ImageAnalysis {
@@ -177,16 +195,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `subjects`.
+  ///
+  /// Resets [`subjects_end`](Self::subjects_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_subjects`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_subjects(mut self, val: Vec<SmolStr>) -> Self {
-    self.subjects = val;
+    self.set_subjects(val);
     self
   }
 
   /// In-place setter for `subjects`.
+  ///
+  /// Resets [`subjects_end`](Self::subjects_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_subjects(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.subjects = val;
+    self.subjects_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- subjects_end ---
+
+  /// How `subjects` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn subjects_end(&self) -> ListEnd {
+    self.subjects_end
+  }
+
+  /// Builder-style setter for `subjects_end`. Set it after `subjects`: setting
+  /// the list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_subjects_end(mut self, val: ListEnd) -> Self {
+    self.subjects_end = val;
+    self
+  }
+
+  /// In-place setter for `subjects_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_subjects_end(&mut self, val: ListEnd) -> &mut Self {
+    self.subjects_end = val;
     self
   }
 
@@ -199,16 +248,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `objects`.
+  ///
+  /// Resets [`objects_end`](Self::objects_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_objects`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_objects(mut self, val: Vec<SmolStr>) -> Self {
-    self.objects = val;
+    self.set_objects(val);
     self
   }
 
   /// In-place setter for `objects`.
+  ///
+  /// Resets [`objects_end`](Self::objects_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_objects(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.objects = val;
+    self.objects_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- objects_end ---
+
+  /// How `objects` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn objects_end(&self) -> ListEnd {
+    self.objects_end
+  }
+
+  /// Builder-style setter for `objects_end`. Set it after `objects`: setting
+  /// the list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_objects_end(mut self, val: ListEnd) -> Self {
+    self.objects_end = val;
+    self
+  }
+
+  /// In-place setter for `objects_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_objects_end(&mut self, val: ListEnd) -> &mut Self {
+    self.objects_end = val;
     self
   }
 
@@ -221,16 +301,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `actions`.
+  ///
+  /// Resets [`actions_end`](Self::actions_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_actions`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_actions(mut self, val: Vec<SmolStr>) -> Self {
-    self.actions = val;
+    self.set_actions(val);
     self
   }
 
   /// In-place setter for `actions`.
+  ///
+  /// Resets [`actions_end`](Self::actions_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_actions(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.actions = val;
+    self.actions_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- actions_end ---
+
+  /// How `actions` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn actions_end(&self) -> ListEnd {
+    self.actions_end
+  }
+
+  /// Builder-style setter for `actions_end`. Set it after `actions`: setting
+  /// the list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_actions_end(mut self, val: ListEnd) -> Self {
+    self.actions_end = val;
+    self
+  }
+
+  /// In-place setter for `actions_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_actions_end(&mut self, val: ListEnd) -> &mut Self {
+    self.actions_end = val;
     self
   }
 
@@ -243,16 +354,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `emotion`.
+  ///
+  /// Resets [`emotion_end`](Self::emotion_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_emotion`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_emotion(mut self, val: Vec<SmolStr>) -> Self {
-    self.emotion = val;
+    self.set_emotion(val);
     self
   }
 
   /// In-place setter for `emotion`.
+  ///
+  /// Resets [`emotion_end`](Self::emotion_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_emotion(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.emotion = val;
+    self.emotion_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- emotion_end ---
+
+  /// How `emotion` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn emotion_end(&self) -> ListEnd {
+    self.emotion_end
+  }
+
+  /// Builder-style setter for `emotion_end`. Set it after `emotion`: setting
+  /// the list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_emotion_end(mut self, val: ListEnd) -> Self {
+    self.emotion_end = val;
+    self
+  }
+
+  /// In-place setter for `emotion_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_emotion_end(&mut self, val: ListEnd) -> &mut Self {
+    self.emotion_end = val;
     self
   }
 
@@ -288,16 +430,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `lighting`.
+  ///
+  /// Resets [`lighting_end`](Self::lighting_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_lighting`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_lighting(mut self, val: Vec<SmolStr>) -> Self {
-    self.lighting = val;
+    self.set_lighting(val);
     self
   }
 
   /// In-place setter for `lighting`.
+  ///
+  /// Resets [`lighting_end`](Self::lighting_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_lighting(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.lighting = val;
+    self.lighting_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- lighting_end ---
+
+  /// How `lighting` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn lighting_end(&self) -> ListEnd {
+    self.lighting_end
+  }
+
+  /// Builder-style setter for `lighting_end`. Set it after `lighting`: setting
+  /// the list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_lighting_end(mut self, val: ListEnd) -> Self {
+    self.lighting_end = val;
+    self
+  }
+
+  /// In-place setter for `lighting_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_lighting_end(&mut self, val: ListEnd) -> &mut Self {
+    self.lighting_end = val;
     self
   }
 
@@ -311,16 +484,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `tags`.
+  ///
+  /// Resets [`tags_end`](Self::tags_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_tags`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_tags(mut self, val: Vec<SmolStr>) -> Self {
-    self.tags = val;
+    self.set_tags(val);
     self
   }
 
   /// In-place setter for `tags`.
+  ///
+  /// Resets [`tags_end`](Self::tags_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_tags(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.tags = val;
+    self.tags_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- tags_end ---
+
+  /// How `tags` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn tags_end(&self) -> ListEnd {
+    self.tags_end
+  }
+
+  /// Builder-style setter for `tags_end`. Set it after `tags`: setting the
+  /// list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_tags_end(mut self, val: ListEnd) -> Self {
+    self.tags_end = val;
+    self
+  }
+
+  /// In-place setter for `tags_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_tags_end(&mut self, val: ListEnd) -> &mut Self {
+    self.tags_end = val;
     self
   }
 
@@ -333,16 +537,47 @@ impl ImageAnalysis {
   }
 
   /// Builder-style setter for `categories`.
+  ///
+  /// Resets [`categories_end`](Self::categories_end) to [`ListEnd::Unknown`], as
+  /// [`Self::set_categories`] does.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn with_categories(mut self, val: Vec<SmolStr>) -> Self {
-    self.categories = val;
+    self.set_categories(val);
     self
   }
 
   /// In-place setter for `categories`.
+  ///
+  /// Resets [`categories_end`](Self::categories_end) to [`ListEnd::Unknown`]: how the
+  /// old list ended says nothing about the new one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_categories(&mut self, val: Vec<SmolStr>) -> &mut Self {
     self.categories = val;
+    self.categories_end = ListEnd::Unknown;
+    self
+  }
+
+  // --- categories_end ---
+
+  /// How `categories` ends: closed short of its cap, or capped — or unknown.
+  /// See [`ListEnd`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn categories_end(&self) -> ListEnd {
+    self.categories_end
+  }
+
+  /// Builder-style setter for `categories_end`. Set it after `categories`: setting
+  /// the list resets it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_categories_end(mut self, val: ListEnd) -> Self {
+    self.categories_end = val;
+    self
+  }
+
+  /// In-place setter for `categories_end`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_categories_end(&mut self, val: ListEnd) -> &mut Self {
+    self.categories_end = val;
     self
   }
 }
@@ -380,6 +615,40 @@ pub enum DescriptionEnd {
   /// stopped it, kept as written — less only the bytes of a last token the
   /// decoder names as cut ([`FieldEnd::with_cut`]).
   Ragged,
+}
+
+/// How one of an [`ImageAnalysis`]'s lists ends: `subjects`, `objects`,
+/// `actions`, `emotion`, `lighting`, `tags` or `categories`.
+///
+/// A task that caps a list's length — the canonical `ImageAnalysisTask`
+/// states each list's cap as the schema's `maxItems` — has a
+/// constrained decoder close the list once it holds that many items, however
+/// many more the model would have listed (findit-studio/llmtask#18: a small
+/// model kept appending `categories` until the token budget ran out). A
+/// list's end, unlike the description's ([`DescriptionEnd`]), is read from
+/// the answer itself: its items are counted against the cap, and an answer
+/// cut off inside the list shows where it stops.
+///
+/// What the answer cannot show is whether the model would have gone on once
+/// the list reached its cap: such a list is [`Capped`](Self::Capped) whether
+/// the grammar closed it there or the model ended it at exactly that count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum ListEnd {
+  /// Nothing says how the list ended: the task did not ask for it, or it was
+  /// built by hand, or read from a document that does not record its end.
+  /// The default.
+  #[default]
+  Unknown,
+  /// The answer closed the list holding fewer items than its cap: no item
+  /// was dropped for the list's length.
+  Whole,
+  /// The list reached its cap, or the answer was cut off inside it. It holds
+  /// the items the answer listed first — no more than the cap, and only
+  /// those written whole before a cut — and the model may have had more.
+  Capped,
 }
 
 // Tests run under both std (default) and `--no-default-features
@@ -467,28 +736,164 @@ mod tests {
     assert_eq!(read.categories(), ["animal"]);
   }
 
-  /// LAW (Codex R4, [high]): **the mark is written last, after the ten
-  /// fields in the places 0.4.x wrote them, and round-trips by its
-  /// snake-case name.** A positional format reads fields by place, so the
-  /// mark between `description` and `subjects` would present a 0.4.x
-  /// payload's `subjects` where the mark is read; the order is asserted on
-  /// the JSON written, key for key.
+  /// LAW (Codex R4, [high]): **each mark is written after every field
+  /// written before it existed, and round-trips by its snake-case name.** A
+  /// positional format reads fields by place, so a mark between two older
+  /// fields would present an older payload's next field where the mark is
+  /// read; the order is asserted on the JSON written, key for key: the ten
+  /// fields 0.4.x wrote, `description_end`, then the seven list ends.
   #[cfg(all(feature = "serde", feature = "json"))]
   #[test]
-  fn the_description_end_is_written_last_and_round_trips() {
-    let ragged = ImageAnalysis::new()
+  fn the_marks_are_written_after_the_fields_before_them_and_round_trip() {
+    let marked = ImageAnalysis::new()
       .with_scene("kitchen")
       .with_description("A cat sleeps on a")
       .with_description_end(DescriptionEnd::Ragged)
       .with_subjects(vec!["cat".into()])
-      .with_tags(vec!["cat".into(), "rug".into()]);
-    let written = serde_json::to_string(&ragged).expect("an analysis serializes");
+      .with_subjects_end(ListEnd::Whole)
+      .with_tags(vec!["cat".into(), "rug".into()])
+      .with_tags_end(ListEnd::Whole)
+      .with_categories(vec!["animal".into(), "pet".into(), "home".into()])
+      .with_categories_end(ListEnd::Capped);
+    let written = serde_json::to_string(&marked).expect("an analysis serializes");
     assert_eq!(
       written,
-      r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":[],"actions":[],"emotion":[],"shot_type":"","lighting":[],"tags":["cat","rug"],"categories":[],"description_end":"ragged"}"#
+      r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":[],"actions":[],"emotion":[],"shot_type":"","lighting":[],"tags":["cat","rug"],"categories":["animal","pet","home"],"description_end":"ragged","subjects_end":"whole","objects_end":"unknown","actions_end":"unknown","emotion_end":"unknown","lighting_end":"unknown","tags_end":"whole","categories_end":"capped"}"#
     );
     let read: ImageAnalysis = serde_json::from_str(&written).expect("it reads back");
-    assert_eq!(read, ragged);
+    assert_eq!(read, marked);
+  }
+
+  /// LAW: **a document 0.5.2 wrote reads, its list ends unknown.** The JSON
+  /// below is the shape 0.5.2 serializes, its eleven keys in their order and
+  /// no list end: it reads every field as written and every list end —
+  /// `tags_end` among them — as [`ListEnd::Unknown`].
+  #[cfg(all(feature = "serde", feature = "json"))]
+  #[test]
+  fn a_document_0_5_2_wrote_reads_with_its_list_ends_unknown() {
+    let written_by_0_5_2 = r#"{"scene":"kitchen","description":"A cat sleeps on a","subjects":["cat"],"objects":["rug"],"actions":["sleeping"],"emotion":["calm"],"shot_type":"wide","lighting":["soft"],"tags":["cat","rug"],"categories":["animal"],"description_end":"ragged"}"#;
+    let read: ImageAnalysis =
+      serde_json::from_str(written_by_0_5_2).expect("a 0.5.2 document reads");
+    assert_eq!(read.description_end(), DescriptionEnd::Ragged);
+    assert_eq!(read.subjects(), ["cat"]);
+    assert_eq!(read.tags(), ["cat", "rug"]);
+    assert_eq!(read.tags_end(), ListEnd::Unknown);
+    assert_eq!(read.categories(), ["animal"]);
+    for (name, end, ..) in lists() {
+      assert_eq!(end(&read), ListEnd::Unknown, "{name}");
+    }
+  }
+
+  /// A list's accessors: its name, how it ends, its builder and in-place
+  /// setters, and its end's builder setter.
+  type List = (
+    &'static str,
+    fn(&ImageAnalysis) -> ListEnd,
+    fn(ImageAnalysis, Vec<SmolStr>) -> ImageAnalysis,
+    fn(&mut ImageAnalysis, Vec<SmolStr>) -> &mut ImageAnalysis,
+    fn(ImageAnalysis, ListEnd) -> ImageAnalysis,
+  );
+
+  /// The seven lists whose end an [`ImageAnalysis`] records, in field order.
+  fn lists() -> [List; 7] {
+    [
+      (
+        "subjects",
+        ImageAnalysis::subjects_end,
+        ImageAnalysis::with_subjects,
+        ImageAnalysis::set_subjects,
+        ImageAnalysis::with_subjects_end,
+      ),
+      (
+        "objects",
+        ImageAnalysis::objects_end,
+        ImageAnalysis::with_objects,
+        ImageAnalysis::set_objects,
+        ImageAnalysis::with_objects_end,
+      ),
+      (
+        "actions",
+        ImageAnalysis::actions_end,
+        ImageAnalysis::with_actions,
+        ImageAnalysis::set_actions,
+        ImageAnalysis::with_actions_end,
+      ),
+      (
+        "emotion",
+        ImageAnalysis::emotion_end,
+        ImageAnalysis::with_emotion,
+        ImageAnalysis::set_emotion,
+        ImageAnalysis::with_emotion_end,
+      ),
+      (
+        "lighting",
+        ImageAnalysis::lighting_end,
+        ImageAnalysis::with_lighting,
+        ImageAnalysis::set_lighting,
+        ImageAnalysis::with_lighting_end,
+      ),
+      (
+        "tags",
+        ImageAnalysis::tags_end,
+        ImageAnalysis::with_tags,
+        ImageAnalysis::set_tags,
+        ImageAnalysis::with_tags_end,
+      ),
+      (
+        "categories",
+        ImageAnalysis::categories_end,
+        ImageAnalysis::with_categories,
+        ImageAnalysis::set_categories,
+        ImageAnalysis::with_categories_end,
+      ),
+    ]
+  }
+
+  /// LAW: **setting or clearing a list resets how it ends**, as setting the
+  /// description resets its mark: the mark describes the list it was
+  /// recorded with, and a new list — or none — is `Unknown` until a caller
+  /// sets it again. Each list's mark is its own, and the description's
+  /// setters leave every list's.
+  #[test]
+  fn the_list_mutators_reset_how_the_list_ends() {
+    for (name, end, with_list, set_list, with_end) in lists() {
+      assert_eq!(end(&ImageAnalysis::new()), ListEnd::Unknown, "{name}");
+      let marked = with_end(
+        with_list(ImageAnalysis::new(), vec!["a".into()]),
+        ListEnd::Capped,
+      );
+      assert_eq!(end(&marked), ListEnd::Capped, "{name}");
+      assert_eq!(
+        end(&with_list(marked.clone(), vec!["b".into()])),
+        ListEnd::Unknown,
+        "{name}: a new list"
+      );
+      let mut cleared = marked.clone();
+      set_list(&mut cleared, Vec::new());
+      assert_eq!(end(&cleared), ListEnd::Unknown, "{name}: cleared");
+      for (other, _, other_with_list, ..) in lists() {
+        if other != name {
+          assert_eq!(
+            end(&other_with_list(marked.clone(), vec!["c".into()])),
+            ListEnd::Capped,
+            "{name} beside {other}"
+          );
+        }
+      }
+      assert_eq!(
+        end(&marked.clone().with_description("A cat.")),
+        ListEnd::Capped,
+        "{name} beside the description"
+      );
+      assert_eq!(
+        end(&with_end(
+          with_list(marked, vec!["d".into()]),
+          ListEnd::Whole
+        )),
+        ListEnd::Whole,
+        "{name}: set after the list, the mark stands"
+      );
+    }
   }
 
   #[test]
@@ -531,7 +936,7 @@ mod image_analysis_task {
   // lib.rs).
   use std::{collections::BTreeMap, string::String, vec::Vec};
 
-  use super::{DescriptionEnd, ImageAnalysis};
+  use super::{DescriptionEnd, ImageAnalysis, ListEnd};
   use crate::{
     grammar::Grammar,
     task::{FieldCaps, FieldEnd, FieldEnds, JsonParseError, Task},
@@ -657,19 +1062,21 @@ Rules:
   /// is refused as [`UnknownExtension`], which names it, and so are
   /// `description` and `tags`, which are not extensions.
   ///
-  /// | Extension | Name | JSON type |
-  /// | --- | --- | --- |
-  /// | [`Scene`](Self::Scene) | `scene` | string |
-  /// | [`Subjects`](Self::Subjects) | `subjects` | array of strings |
-  /// | [`Objects`](Self::Objects) | `objects` | array of strings |
-  /// | [`Actions`](Self::Actions) | `actions` | array of strings |
-  /// | [`Emotion`](Self::Emotion) | `emotion` | array of strings |
-  /// | [`ShotType`](Self::ShotType) | `shot_type` | string |
-  /// | [`Lighting`](Self::Lighting) | `lighting` | array of strings |
-  /// | [`Categories`](Self::Categories) | `categories` | array of strings |
+  /// | Extension | Name | JSON type | Default cap |
+  /// | --- | --- | --- | --- |
+  /// | [`Scene`](Self::Scene) | `scene` | string | |
+  /// | [`Subjects`](Self::Subjects) | `subjects` | array of strings | 8 items |
+  /// | [`Objects`](Self::Objects) | `objects` | array of strings | 8 items |
+  /// | [`Actions`](Self::Actions) | `actions` | array of strings | 8 items |
+  /// | [`Emotion`](Self::Emotion) | `emotion` | array of strings | 3 items |
+  /// | [`ShotType`](Self::ShotType) | `shot_type` | string | |
+  /// | [`Lighting`](Self::Lighting) | `lighting` | array of strings | 3 items |
+  /// | [`Categories`](Self::Categories) | `categories` | array of strings | 3 items |
   ///
   /// [`Extension::ALL`] lists the extensions and [`Extension::NAMES`] their
-  /// names, both in this order.
+  /// names, both in this order. Each list extension is capped at
+  /// [`ImageAnalysisTask::max_items`] labels, by default
+  /// [`ImageAnalysisTask::default_max_items`].
   ///
   /// ```
   /// use llmtask::image_analysis::{Extension, ImageAnalysisTask};
@@ -712,6 +1119,15 @@ Rules:
 
   // `ImageAnalysisTask` keeps its extensions as one bit each in a `u8`.
   const _: () = assert!(Extension::ALL.len() <= u8::BITS as usize);
+
+  // `ImageAnalysisTask` keeps each extension's cap at `extension as usize`.
+  const _: () = {
+    let mut index = 0;
+    while index < Extension::ALL.len() {
+      assert!(Extension::ALL[index] as usize == index);
+      index += 1;
+    }
+  };
 
   impl Extension {
     /// Every extension, in [`ImageAnalysis`] field order.
@@ -904,13 +1320,64 @@ Rules:
   /// the same schema: the keyword contract is on [`Grammar::JsonSchema`],
   /// and a field that breaks it is refused as
   /// [`JsonParseError::MissingFields`] naming the field. `parse` never
-  /// truncates or rewrites the model's words to make them fit.
+  /// rewrites the model's words to make them fit: a description over its
+  /// cap is refused, and a list over its cap loses whole labels past it,
+  /// never part of one.
+  ///
+  /// # The lists
+  ///
+  /// Every list the task asks for holds at most a cap of labels, stated in
+  /// the schema as its `maxItems`: `tags` at most
+  /// [`tags_max_items`](Self::tags_max_items), which the prompt states too,
+  /// and each list extension — `subjects`, `objects`, `actions`, `emotion`,
+  /// `lighting` and `categories` — at most [`max_items`](Self::max_items),
+  /// which the prompt does not. A constrained decoder closes a list at its
+  /// cap however long the model would have gone on, so a model that keeps
+  /// appending labels cannot run the answer out of tokens inside one
+  /// (findit-studio/llmtask#18). The list extensions' caps default by what
+  /// each list holds ([`default_max_items`](Self::default_max_items)); a
+  /// deployment sets its own with [`with_max_items`](Self::with_max_items).
+  ///
+  /// `parse` reads every list to its cap rather than refusing it. The list
+  /// is read whole first, so an element that is not a string refuses the
+  /// field by name; then it keeps its first `cap` elements as the answer
+  /// wrote them — the cap counts elements as `maxItems` does, before labels
+  /// are trimmed and deduplicated — and the [`ImageAnalysis`] records how it
+  /// ended as its [`ListEnd`]: `Capped` when the answer listed at least the
+  /// cap's count, `Whole` when it closed the list short of it.
+  ///
+  /// # An answer cut off inside a list
+  ///
+  /// A token budget can end an answer before its JSON closes. Such a text is
+  /// not JSON and is refused as [`JsonParseError::Json`], with one exception:
+  /// a text that is JSON as far as it goes and ends inside the array of a
+  /// list the task asks for — after its `[`, after an item, after a comma,
+  /// or inside a string item — is read as the answer closed after that
+  /// list's last whole item. A string item the cut left open is dropped, the
+  /// array and the object are closed, the closed answer goes through every
+  /// check any answer goes through, and the cut list is `Capped`.
+  ///
+  /// - **Read:** the cut list is the last field the task asks for in the
+  ///   answer, so every other field was written whole before it — as an
+  ///   engine that writes the members in the schema's order writes the last
+  ///   list in [`ImageAnalysis`] order: `categories` when the task asks for
+  ///   it, `tags` otherwise.
+  /// - **Refused by name:** a field the task asks for that the cut left
+  ///   unwritten is [`JsonParseError::MissingFields`] naming it, and the
+  ///   closed answer's other refusals stand: an undeclared key, a duplicated
+  ///   key, a value of another type.
+  /// - **Not JSON:** a cut anywhere else — before the object opens, in a key
+  ///   or before its value, inside or after a string field, after a list's
+  ///   own `]`, inside an item that is not a string, inside a list the task
+  ///   does not ask for — is [`JsonParseError::Json`].
   ///
   /// # Example
   ///
   /// ```
+  /// use core::num::NonZeroUsize;
+  ///
   /// use llmtask::{
-  ///   JsonParseError, Task,
+  ///   JsonParseError, ListEnd, Task,
   ///   image_analysis::{Extension, ImageAnalysisTask},
   /// };
   ///
@@ -957,6 +1424,25 @@ Rules:
   ///   ImageAnalysisTask::new().parse(raw),
   ///   Err(JsonParseError::MissingFields(fields)) if fields == ["description"]
   /// ));
+  ///
+  /// // A list extension is read to its cap: the labels past it are dropped
+  /// // whole, and the analysis records that the list was capped.
+  /// let task = ImageAnalysisTask::new()
+  ///   .with_extensions([Extension::Categories])
+  ///   .with_max_items(Extension::Categories, NonZeroUsize::new(2).unwrap());
+  /// let raw = r#"{
+  ///   "description": "Two people talk across a desk.", "tags": ["office"],
+  ///   "categories": ["work", "business", "meeting"]
+  /// }"#;
+  /// let analysis = task.parse(raw).expect("a list over its cap is read to it");
+  /// assert_eq!(analysis.categories(), ["work", "business"]);
+  /// assert_eq!(analysis.categories_end(), ListEnd::Capped);
+  ///
+  /// // An answer cut off inside its last list keeps the items written whole.
+  /// let raw = r#"{"description": "Two people talk.", "tags": ["office"], "categories": ["work", "busi"#;
+  /// let analysis = task.parse(raw).expect("the cut list is the answer's last field");
+  /// assert_eq!(analysis.categories(), ["work"]);
+  /// assert_eq!(analysis.categories_end(), ListEnd::Capped);
   /// ```
   #[derive(Clone)]
   pub struct ImageAnalysisTask {
@@ -964,10 +1450,13 @@ Rules:
     extensions: u8,
     description_max_chars: NonZeroUsize,
     tags_max_items: NonZeroUsize,
+    // Each extension's `max_items`, at `extension as usize`: `None` for the
+    // two string extensions.
+    list_max_items: [Option<NonZeroUsize>; Extension::ALL.len()],
     accept_empty: bool,
-    // Both derived from `extensions` and the two caps by `rebuild`, which
-    // every setter of those three calls, so the schema, the prompt and
-    // `parse` always describe the same roster.
+    // Both derived from `extensions` and the caps by `rebuild`, which every
+    // setter of those calls, so the schema, the prompt and `parse` always
+    // describe the same roster.
     schema: Value,
     prompt: String,
   }
@@ -985,18 +1474,46 @@ Rules:
     /// style, while keeping the answer short.
     pub const DEFAULT_TAGS_MAX_ITEMS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
+    /// [`Self::default_max_items`] of the lists that name one quality of the
+    /// whole picture.
+    const QUALITY_MAX_ITEMS: NonZeroUsize = NonZeroUsize::new(3).unwrap();
+
+    /// The [`max_items`](Self::max_items) a task gives `extension`'s list
+    /// unless [`with_max_items`](Self::with_max_items) sets another, or
+    /// `None` for `scene` and `shot_type`, which are single strings.
+    ///
+    /// Each default is sized from what the list holds. `subjects`, `objects`
+    /// and `actions` inventory what the picture shows, as `tags` does, and
+    /// take [`Self::DEFAULT_TAGS_MAX_ITEMS`]; `emotion`, `lighting` and
+    /// `categories` each name one quality of the whole picture — its tone,
+    /// its light, its broad kind — in a handful of words, and take 3.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn default_max_items(extension: Extension) -> Option<NonZeroUsize> {
+      match extension {
+        Extension::Scene | Extension::ShotType => None,
+        Extension::Subjects | Extension::Objects | Extension::Actions => {
+          Some(Self::DEFAULT_TAGS_MAX_ITEMS)
+        }
+        Extension::Emotion | Extension::Lighting | Extension::Categories => {
+          Some(Self::QUALITY_MAX_ITEMS)
+        }
+      }
+    }
+
     /// Construct the default task: `description` and `tags` only, capped
     /// at [`Self::DEFAULT_DESCRIPTION_MAX_CHARS`] characters and
     /// [`Self::DEFAULT_TAGS_MAX_ITEMS`] tags, with no extension switched
-    /// on and `accept_empty = false` (a payload that lacks the required
-    /// indexable content is treated as a model regression and rejected;
-    /// see [`Self::with_accept_empty`] for the full predicate and the
-    /// opt-in alternative).
+    /// on (each list extension capped at its [`Self::default_max_items`]
+    /// once it is) and `accept_empty = false` (a payload that lacks the
+    /// required indexable content is treated as a model regression and
+    /// rejected; see [`Self::with_accept_empty`] for the full predicate and
+    /// the opt-in alternative).
     pub fn new() -> Self {
       let mut task = Self {
         extensions: 0,
         description_max_chars: Self::DEFAULT_DESCRIPTION_MAX_CHARS,
         tags_max_items: Self::DEFAULT_TAGS_MAX_ITEMS,
+        list_max_items: Extension::ALL.map(Self::default_max_items),
         accept_empty: false,
         schema: Value::Null,
         prompt: String::new(),
@@ -1060,7 +1577,8 @@ Rules:
     }
 
     /// The most labels `tags` may hold. Stated in the schema as `maxItems`
-    /// and in the prompt; `parse` refuses an answer listing more by name.
+    /// and in the prompt; `parse` reads a longer list to it and records how
+    /// the list ended as its [`ListEnd`].
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn tags_max_items(&self) -> NonZeroUsize {
       self.tags_max_items
@@ -1078,6 +1596,37 @@ Rules:
     pub fn set_tags_max_items(&mut self, val: NonZeroUsize) -> &mut Self {
       self.tags_max_items = val;
       self.rebuild();
+      self
+    }
+
+    /// The most labels `extension`'s list may hold, or `None` for `scene`
+    /// and `shot_type`, which are single strings. Stated in the schema as
+    /// the list's `maxItems`, so a constrained decoder closes the list there;
+    /// `parse` reads a longer list to it and records how the list ended as
+    /// its [`ListEnd`]. The prompt does not state it.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub const fn max_items(&self, extension: Extension) -> Option<NonZeroUsize> {
+      self.list_max_items[extension as usize]
+    }
+
+    /// Builder-style setter for `extension`'s [`max_items`](Self::max_items),
+    /// to raise a cap a deployment finds too low, or to lower one. The schema
+    /// and the prompt are rebuilt to match. `scene` and `shot_type` hold no
+    /// items: for them this changes nothing, and their `max_items` stays
+    /// `None`.
+    pub fn with_max_items(mut self, extension: Extension, val: NonZeroUsize) -> Self {
+      self.set_max_items(extension, val);
+      self
+    }
+
+    /// In-place setter for `extension`'s [`max_items`](Self::max_items). See
+    /// [`Self::with_max_items`].
+    pub fn set_max_items(&mut self, extension: Extension, val: NonZeroUsize) -> &mut Self {
+      let cap = &mut self.list_max_items[extension as usize];
+      if cap.is_some() {
+        *cap = Some(val);
+        self.rebuild();
+      }
       self
     }
 
@@ -1219,8 +1768,9 @@ Rules:
     /// constraint a constrained-decoding engine can enforce at generation
     /// time, but `parse` cannot inherit for free: reading already-generated
     /// text accepts any key regardless of what the schema says, so `parse`
-    /// enforces this promise itself via `unknown_fields`, and each field's
-    /// type and cap via `usable_value`.
+    /// enforces this promise itself via `unknown_fields`, each field's type
+    /// and the cap it refuses a value over via `usable_value`, and each
+    /// list's cap via `settle_list`, which reads the list to it.
     fn build_schema(&self) -> Value {
       let properties: Map<String, Value> = self
         .fields()
@@ -1236,7 +1786,12 @@ Rules:
     }
 
     /// `field`'s entry in the schema's `properties`: the JSON type of its
-    /// [`Shape`], plus the task's cap on `description` and on `tags`.
+    /// [`Shape`], plus the task's cap on it — `maxLength` on `description`,
+    /// `maxItems` on each list, `tags` and the list extensions.
+    ///
+    /// No other keyword: an engine refuses a schema that uses one it does
+    /// not implement, and llguidance implements no `uniqueItems`, so the
+    /// labels are deduplicated by `parse` rather than by the grammar.
     fn property_schema(&self, field: Field) -> Value {
       let mut property = match field.shape() {
         Shape::String => json!({ "type": "string" }),
@@ -1244,7 +1799,6 @@ Rules:
       };
       match field {
         Field::Description => property["maxLength"] = self.description_max_chars.get().into(),
-        Field::Tags => property["maxItems"] = self.tags_max_items.get().into(),
         Field::Scene
         | Field::Subjects
         | Field::Objects
@@ -1252,9 +1806,27 @@ Rules:
         | Field::Emotion
         | Field::ShotType
         | Field::Lighting
-        | Field::Categories => {}
+        | Field::Tags
+        | Field::Categories => {
+          if let Some(cap) = self.list_cap(field) {
+            property["maxItems"] = cap.get().into();
+          }
+        }
       }
       property
+    }
+
+    /// The cap on `field`'s labels when `field` is a list: `tags`'
+    /// [`tags_max_items`](Self::tags_max_items), a list extension's
+    /// [`max_items`](Self::max_items). `None` for a string field.
+    fn list_cap(&self, field: Field) -> Option<NonZeroUsize> {
+      if field == Field::Tags {
+        return Some(self.tags_max_items);
+      }
+      Extension::ALL
+        .into_iter()
+        .find(|extension| extension.field() == field)
+        .and_then(|extension| self.max_items(extension))
     }
 
     /// The prompt for the task: [`PROMPT_HEAD`], one paragraph per field
@@ -1348,10 +1920,10 @@ Rules:
 
     /// `field`'s value in the answer, `value`, decoded as the task can use
     /// it: present, of exactly the JSON type the schema declares for the
-    /// field (see [`decode_field`]), and within any cap the schema declares
-    /// (see [`Self::exceeds_cap`]). `Ok(None)` leaves the field unusable:
-    /// absent, `null`, of any other JSON type, or over a cap. Keys outside
-    /// the roster are a separate concern, handled by
+    /// field (see [`decode_field`]), and within any cap the task refuses a
+    /// longer value over (see [`Self::exceeds_cap`]). `Ok(None)` leaves the
+    /// field unusable: absent, `null`, of any other JSON type, or over such
+    /// a cap. Keys outside the roster are a separate concern, handled by
     /// [`Self::unknown_fields`].
     ///
     /// Folding "wrong type" into the same named-field list as
@@ -1363,7 +1935,9 @@ Rules:
     /// over a cap is folded in for the same reason: the schema promises
     /// the cap, so such a value has drifted from the schema as a wrong-typed
     /// one has, and `parse` refuses it by name rather than truncating the
-    /// model's words to fit. `parse` names every unusable field at once.
+    /// model's words to fit. A list's cap is not such a cap:
+    /// [`Self::settle_list`] reads the list to it, dropping whole labels.
+    /// `parse` names every unusable field at once.
     fn usable_value(
       &self,
       field: Field,
@@ -1375,16 +1949,16 @@ Rules:
       Ok(decode_field(field, value)?.filter(|value| !self.exceeds_cap(field, value)))
     }
 
-    /// `true` iff `value` holds more than the cap `field`'s schema entry
-    /// declares, counted the way the schema counts: `description` in
-    /// Unicode scalar values of the string as the answer wrote it (before
-    /// `parse` trims it), `tags` in elements of the array.
+    /// `true` iff `value` holds more than the one cap the task refuses a
+    /// longer value over, the description's, counted the way the schema
+    /// counts `maxLength`: in Unicode scalar values of the string as the
+    /// answer wrote it (before `parse` trims it). A list's cap never makes
+    /// its value unusable: [`Self::settle_list`] reads the list to it.
     fn exceeds_cap(&self, field: Field, value: &FieldValue) -> bool {
       match (field, value) {
         (Field::Description, FieldValue::String(description)) => {
           description.chars().count() > self.description_max_chars.get()
         }
-        (Field::Tags, FieldValue::Strings(tags)) => tags.len() > self.tags_max_items.get(),
         _ => false,
       }
     }
@@ -1424,6 +1998,48 @@ Rules:
         .unwrap_or_else(|| written.trim());
       Ok((SmolStr::new(kept), DescriptionEnd::Ragged))
     }
+
+    /// A list's `value` — `tags`' or a list extension's — as
+    /// [`ImageAnalysis`] holds it, and how the list ends ([`ListEnd`]). The
+    /// cap ([`Self::list_cap`]) counts the elements as the answer
+    /// wrote them, as the schema's `maxItems` does: a list of at least the
+    /// cap's count keeps its first `cap` elements and is `Capped`, a shorter
+    /// one is kept whole and is `Whole`. A list the answer was cut off
+    /// inside (`cut`) is `Capped` whatever its count. Only then are the
+    /// kept elements made labels (see [`FieldValue::into_labels`]).
+    fn settle_list(
+      &self,
+      field: Field,
+      mut value: FieldValue,
+      cut: Option<Field>,
+    ) -> (Vec<SmolStr>, ListEnd) {
+      let mut end = if cut == Some(field) {
+        ListEnd::Capped
+      } else {
+        ListEnd::Whole
+      };
+      if let (FieldValue::Strings(strings), Some(cap)) = (&mut value, self.list_cap(field))
+        && strings.len() >= cap.get()
+      {
+        strings.truncate(cap.get());
+        end = ListEnd::Capped;
+      }
+      (value.into_labels(), end)
+    }
+
+    /// `raw` closed where a cut left one of its lists open, and that list's
+    /// field: `raw` up to the end of the last item the list holds whole, then
+    /// `]}`. `None` unless `raw` ends inside the array of a list the task
+    /// asks for (see [`cut_list`]).
+    fn close_cut_list(&self, raw: &str) -> Option<(String, Field)> {
+      let (key, whole) = cut_list(raw)?;
+      let field = self
+        .fields()
+        .find(|&field| field.key() == key && self.list_cap(field).is_some())?;
+      let mut closed = String::from(raw.get(..whole)?);
+      closed.push_str("]}");
+      Some((closed, field))
+    }
   }
 
   impl Default for ImageAnalysisTask {
@@ -1459,7 +2075,9 @@ Rules:
     /// `ends` — the `"description"` entry — exactly as
     /// [`ImageAnalysisTask::parse_with_description_end`] settles it; with
     /// no such entry, as [`Task::parse`]. An account of any other field is
-    /// ignored: the description is the one string the task caps.
+    /// ignored: the description is the one string the task caps. Every list
+    /// is read from the answer's text as `Task::parse` reads it: its
+    /// [`ListEnd`] needs no account.
     ///
     /// # Errors
     ///
@@ -1472,7 +2090,8 @@ Rules:
     /// The description's cap, [`ImageAnalysisTask::description_max_chars`]
     /// — the `maxLength` the schema states for it — so an engine reads the
     /// description's account against the cap the task settles it by. No
-    /// other field is capped in characters (`tags` caps its items).
+    /// other field is capped in characters: `tags` and the list extensions
+    /// cap their items.
     fn field_caps(&self) -> FieldCaps {
       let mut caps = FieldCaps::new();
       caps.insert(Field::Description.key(), self.description_max_chars.get());
@@ -1496,7 +2115,31 @@ Rules:
       // can be named. `raw` goes in untrimmed: the deserializer skips the
       // JSON whitespace a JSON text may carry around its value, and any
       // other character there is not JSON.
-      let Some(members) = parse_members(raw)? else {
+      match parse_members(raw) {
+        // JSON as far as it goes, but it ends too soon: an answer cut off
+        // inside a list is read as the answer closed after that list's last
+        // whole item; any other is not JSON.
+        Err(JsonParseError::Json(err)) if err.is_eof() => match self.close_cut_list(raw) {
+          Some((closed, cut)) => {
+            self.read_answer(parse_members(&closed)?, Some(cut), description_end)
+          }
+          None => Err(JsonParseError::Json(err)),
+        },
+        members => self.read_answer(members?, None, description_end),
+      }
+    }
+
+    /// The analysis the answer's top-level `members` hold (`None`: the
+    /// answer is not a JSON object), with the decoder's account of how it
+    /// ended the description when there is one; `cut` is the list the
+    /// answer was cut off inside, if it was.
+    fn read_answer(
+      &self,
+      members: Option<BTreeMap<String, &RawValue>>,
+      cut: Option<Field>,
+      description_end: Option<&FieldEnd>,
+    ) -> Result<ImageAnalysis, JsonParseError> {
+      let Some(members) = members else {
         // Not a JSON object at all: by definition every field the task
         // asks for is absent. Naming them via `MissingFields` is more
         // informative than a generic "expected top-level object" error,
@@ -1540,14 +2183,35 @@ Rules:
               self.settle_description(&value.into_string(), description_end)?;
             result.set_description(description).set_description_end(end)
           }
-          Field::Subjects => result.set_subjects(value.into_labels()),
-          Field::Objects => result.set_objects(value.into_labels()),
-          Field::Actions => result.set_actions(value.into_labels()),
-          Field::Emotion => result.set_emotion(value.into_labels()),
+          Field::Subjects => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_subjects(labels).set_subjects_end(end)
+          }
+          Field::Objects => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_objects(labels).set_objects_end(end)
+          }
+          Field::Actions => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_actions(labels).set_actions_end(end)
+          }
+          Field::Emotion => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_emotion(labels).set_emotion_end(end)
+          }
           Field::ShotType => result.set_shot_type(value.into_label()),
-          Field::Lighting => result.set_lighting(value.into_labels()),
-          Field::Tags => result.set_tags(value.into_labels()),
-          Field::Categories => result.set_categories(value.into_labels()),
+          Field::Lighting => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_lighting(labels).set_lighting_end(end)
+          }
+          Field::Tags => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_tags(labels).set_tags_end(end)
+          }
+          Field::Categories => {
+            let (labels, end) = self.settle_list(field, value, cut);
+            result.set_categories(labels).set_categories_end(end)
+          }
         };
       }
       // Indexable-content gate. The prompt's rules instruct the model to
@@ -1747,6 +2411,137 @@ Rules:
     de::Error::custom(format_args!(
       "unpaired UTF-16 surrogate in a string escape at line {line} column {column}"
     ))
+  }
+
+  /// When `raw` ends inside the array value of a member of its top-level
+  /// object: that member's key, JSON-decoded, and how many bytes of `raw`
+  /// run through the last item the array holds whole — through its `[`
+  /// when it holds none. An item the text ends inside is dropped when it is
+  /// a string; a text that ends inside any other item, or anywhere but in a
+  /// member's array (before the object opens, in a key or before its value,
+  /// inside or after another value), gives `None`.
+  ///
+  /// `raw` must be a text serde_json has read as JSON up to its end, which
+  /// came too soon ([`serde_json::Error::is_eof`]): every byte up to there
+  /// is where JSON grammar allows it, so this walk steps over values without
+  /// checking them, and the text it keeps is read again whole, by
+  /// [`parse_members`].
+  fn cut_list(raw: &str) -> Option<(String, usize)> {
+    let bytes = raw.as_bytes();
+    let mut at = skip_whitespace(bytes, 0);
+    if bytes.get(at) != Some(&b'{') {
+      return None;
+    }
+    at = skip_whitespace(bytes, at + 1);
+    loop {
+      if bytes.get(at) != Some(&b'"') {
+        return None;
+      }
+      let key_end = string_end(bytes, at)?;
+      let key: String = serde_json::from_str(raw.get(at..key_end)?).ok()?;
+      at = skip_whitespace(bytes, key_end);
+      if bytes.get(at) != Some(&b':') {
+        return None;
+      }
+      at = skip_whitespace(bytes, at + 1);
+      if bytes.get(at) == Some(&b'[') {
+        // Through the `[`: no item is whole yet.
+        let mut whole = at + 1;
+        at = skip_whitespace(bytes, whole);
+        if bytes.get(at) == Some(&b']') {
+          at += 1;
+        } else {
+          loop {
+            let Some(&first) = bytes.get(at) else {
+              return Some((key, whole));
+            };
+            let Some(end) = value_end(bytes, at) else {
+              return (first == b'"').then_some((key, whole));
+            };
+            whole = end;
+            at = skip_whitespace(bytes, end);
+            match bytes.get(at) {
+              None => return Some((key, whole)),
+              Some(b',') => at = skip_whitespace(bytes, at + 1),
+              Some(b']') => {
+                at += 1;
+                break;
+              }
+              Some(_) => return None,
+            }
+          }
+        }
+      } else {
+        at = value_end(bytes, at)?;
+      }
+      at = skip_whitespace(bytes, at);
+      if bytes.get(at) != Some(&b',') {
+        return None;
+      }
+      at = skip_whitespace(bytes, at + 1);
+    }
+  }
+
+  /// The first byte at or after `at` in `bytes` that is not JSON
+  /// whitespace.
+  fn skip_whitespace(bytes: &[u8], at: usize) -> usize {
+    let mut index = at;
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+      index += 1;
+    }
+    index
+  }
+
+  /// The byte just past the JSON string whose opening quote is at `at` in
+  /// `bytes`, or `None` when the text ends inside it. A backslash opens a
+  /// two-byte escape or `\u` and four hex digits, none of them a quote, so
+  /// stepping over the byte after each backslash meets the closing quote.
+  fn string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut index = at + 1;
+    loop {
+      match *bytes.get(index)? {
+        b'"' => return Some(index + 1),
+        b'\\' => index += 2,
+        _ => index += 1,
+      }
+    }
+  }
+
+  /// The byte just past the JSON value that starts at `at` in `bytes`, or
+  /// `None` when no value starts there or the text ends inside it. A number
+  /// or a literal that runs to the end of the text gives `None` too: the
+  /// text's end cannot show that it is whole.
+  fn value_end(bytes: &[u8], at: usize) -> Option<usize> {
+    match *bytes.get(at)? {
+      b'"' => string_end(bytes, at),
+      b'[' | b'{' => {
+        let mut depth = 0_usize;
+        let mut index = at;
+        loop {
+          match *bytes.get(index)? {
+            b'"' => index = string_end(bytes, index)?,
+            b'[' | b'{' => {
+              depth += 1;
+              index += 1;
+            }
+            b']' | b'}' => {
+              depth = depth.checked_sub(1)?;
+              index += 1;
+              if depth == 0 {
+                return Some(index);
+              }
+            }
+            _ => index += 1,
+          }
+        }
+      }
+      b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => bytes
+        .get(at..)?
+        .iter()
+        .position(|byte| matches!(byte, b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r'))
+        .map(|len| at + len),
+      _ => None,
+    }
   }
 
   /// A field's value, decoded in the JSON type [`Field::shape`] declares
@@ -3209,7 +4004,10 @@ Rules:
 
     /// LAW: the caps appear in the schema, `maxLength` on `description` and
     /// `maxItems` on `tags`, at the named defaults unless a builder sets
-    /// them. No other field carries a cap.
+    /// them. No other field carries a `maxLength`; every other array field —
+    /// each list extension — carries its own `maxItems` (see
+    /// `every_list_extension_states_its_cap_in_the_schema`), and `scene` and
+    /// `shot_type` carry none.
     #[test]
     fn the_caps_appear_in_the_schema() {
       let task = ImageAnalysisTask::new();
@@ -3246,12 +4044,11 @@ Rules:
             "{key} carries no maxLength"
           );
         }
-        if key != "tags" {
-          assert!(
-            property.get("maxItems").is_none(),
-            "{key} carries no maxItems"
-          );
-        }
+        assert_eq!(
+          property.get("maxItems").is_some(),
+          property["type"] == "array",
+          "{key}: every array field, and no other, carries maxItems"
+        );
       }
     }
 
@@ -3281,14 +4078,14 @@ Rules:
       );
     }
 
-    /// An answer over a cap is refused by name, as a missing field is,
-    /// and an answer at a cap parses whole: `parse` never truncates an
-    /// answer to fit a cap, and without the decoder's account it does not
-    /// know how the answer ended.
-    /// `description` is counted in characters, not bytes, and as the answer
-    /// wrote it; `tags` in the elements of its array.
+    /// A description over its cap is refused by name, as a missing field
+    /// is, and one at its cap parses whole: `parse` never truncates a
+    /// description to fit its cap, and without the decoder's account it does
+    /// not know how the description ended. It is counted in characters, not
+    /// bytes, and as the answer wrote it. `tags` is a list: at its cap or
+    /// over it, its elements counted, it is read to the cap and `Capped`.
     #[test]
-    fn an_answer_over_a_cap_is_refused_by_name_and_never_truncated() {
+    fn a_description_over_its_cap_is_refused_by_name_and_never_truncated() {
       let task = ImageAnalysisTask::new()
         .with_description_max_chars(nz(10))
         .with_tags_max_items(nz(3));
@@ -3317,11 +4114,13 @@ Rules:
       let analysis = task
         .parse(r#"{"description":"a","tags":["x","y","z"]}"#)
         .expect("three tags are at the cap");
-      assert_eq!(analysis.tags().len(), 3);
-      assert_eq!(
-        refusal(r#"{"description":"a","tags":["x","y","z","w"]}"#),
-        ["tags"]
-      );
+      assert_eq!(analysis.tags(), ["x", "y", "z"]);
+      assert_eq!(analysis.tags_end(), ListEnd::Capped);
+      let analysis = task
+        .parse(r#"{"description":"a","tags":["x","y","z","w"]}"#)
+        .expect("four tags are read to the cap");
+      assert_eq!(analysis.tags(), ["x", "y", "z"]);
+      assert_eq!(analysis.tags_end(), ListEnd::Capped);
     }
 
     /// `accept_empty` keeps its meaning on the default task: an answer that
@@ -4359,6 +5158,622 @@ Rules:
           matches!(task.parse(answer), Err(JsonParseError::Json(_))),
           "{answer} is not JSON"
         );
+      }
+    }
+
+    // ===== the list extensions' caps (llmtask#18) =====
+
+    /// The six list extensions, in [`Extension::ALL`] order.
+    const LISTS: [Extension; 6] = [
+      Extension::Subjects,
+      Extension::Objects,
+      Extension::Actions,
+      Extension::Emotion,
+      Extension::Lighting,
+      Extension::Categories,
+    ];
+
+    /// How the parsed analysis says `extension`'s list ended.
+    fn list_end(analysis: &ImageAnalysis, extension: Extension) -> ListEnd {
+      match extension {
+        Extension::Subjects => analysis.subjects_end(),
+        Extension::Objects => analysis.objects_end(),
+        Extension::Actions => analysis.actions_end(),
+        Extension::Emotion => analysis.emotion_end(),
+        Extension::Lighting => analysis.lighting_end(),
+        Extension::Categories => analysis.categories_end(),
+        Extension::Scene | Extension::ShotType => panic!("{extension:?} is not a list"),
+      }
+    }
+
+    /// The answer to a task that asks for `extension` besides the default
+    /// fields, whose list is `labels`.
+    fn list_answer(extension: Extension, labels: &[String]) -> String {
+      let list = serde_json::to_string(labels).expect("strings serialize");
+      format!(r#"{{{DEFAULT_MEMBERS},"{}":{list}}}"#, extension.as_str())
+    }
+
+    /// The default task's answer whose `tags` is `labels`.
+    fn tags_answer(labels: &[String]) -> String {
+      let list = serde_json::to_string(labels).expect("strings serialize");
+      format!(r#"{{"description":"A person reads by a window.","tags":{list}}}"#)
+    }
+
+    /// The labels the parsed analysis holds in `tags`.
+    fn tag_labels(analysis: &ImageAnalysis) -> Vec<&str> {
+      analysis.tags().iter().map(SmolStr::as_str).collect()
+    }
+
+    /// LAW (the schema golden): **every list states its cap in the schema as
+    /// `maxItems`**, at its default unless a builder sets it: `tags` at 8 as
+    /// before, `subjects`, `objects` and `actions` at `tags`' 8, `emotion`,
+    /// `lighting` and `categories` at 3. The full roster's schema, key for
+    /// key, and each list's entry alone.
+    #[test]
+    fn every_list_states_its_cap_in_the_schema() {
+      let array =
+        |cap: usize| json!({ "type": "array", "items": { "type": "string" }, "maxItems": cap });
+      assert_eq!(
+        *full_task().schema(),
+        json!({
+          "type": "object",
+          "properties": {
+            "scene": { "type": "string" },
+            "description": { "type": "string", "maxLength": 120 },
+            "subjects": array(8),
+            "objects": array(8),
+            "actions": array(8),
+            "emotion": array(3),
+            "shot_type": { "type": "string" },
+            "lighting": array(3),
+            "tags": array(8),
+            "categories": array(3)
+          },
+          "required": [
+            "scene", "description", "subjects", "objects", "actions",
+            "emotion", "shot_type", "lighting", "tags", "categories"
+          ],
+          "additionalProperties": false
+        })
+      );
+      for extension in LISTS {
+        let cap = ImageAnalysisTask::default_max_items(extension).expect("a list is capped");
+        let task = ImageAnalysisTask::new().with_extensions([extension]);
+        assert_eq!(task.max_items(extension), Some(cap), "{extension:?}");
+        assert_eq!(
+          task.schema()["properties"][extension.as_str()],
+          array(cap.get()),
+          "{extension:?} alone"
+        );
+      }
+      let task = ImageAnalysisTask::new().with_tags_max_items(nz(5));
+      assert_eq!(task.schema()["properties"]["tags"], array(5), "tags alone");
+    }
+
+    /// LAW: **the schema uses no keyword beyond those an engine serving this
+    /// task must honour** — `type`, `properties`, `required`,
+    /// `additionalProperties`, `items`, `maxLength` and `maxItems` — on any
+    /// roster and at any cap. An engine refuses a schema that uses a keyword
+    /// it does not implement (llguidance implements no `uniqueItems`), so
+    /// one more would fail every request instead of shaping the answer.
+    #[test]
+    fn the_schema_uses_only_the_keywords_an_engine_must_honour() {
+      fn keywords<'s>(schema: &'s Value, found: &mut Vec<&'s str>) {
+        let Some(members) = schema.as_object() else {
+          return;
+        };
+        for (keyword, value) in members {
+          found.push(keyword);
+          match keyword.as_str() {
+            "properties" => {
+              for property in value.as_object().into_iter().flat_map(Map::values) {
+                keywords(property, found);
+              }
+            }
+            "items" => keywords(value, found),
+            _ => {}
+          }
+        }
+      }
+      let honoured = [
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "maxLength",
+        "maxItems",
+      ];
+      let tasks = [
+        ImageAnalysisTask::new(),
+        full_task(),
+        full_task()
+          .with_max_items(Extension::Categories, nz(50))
+          .with_tags_max_items(nz(1)),
+      ]
+      .into_iter()
+      .chain(LISTS.map(|extension| ImageAnalysisTask::new().with_extensions([extension])));
+      for task in tasks {
+        let mut found = Vec::new();
+        keywords(task.schema(), &mut found);
+        for keyword in found {
+          assert!(
+            honoured.contains(&keyword),
+            "{keyword} is not a keyword the engine must honour"
+          );
+        }
+      }
+    }
+
+    /// LAW: **a list's cap is its own.** `max_items` reads each list
+    /// extension's default until `with_max_items` or `set_max_items` sets
+    /// it; setting one changes that list's cap alone, in the schema too,
+    /// and the cap stays while the extensions are switched; `scene` and
+    /// `shot_type` have none, and setting one for them changes nothing.
+    #[test]
+    fn a_list_cap_is_set_per_extension() {
+      let task = ImageAnalysisTask::new();
+      for extension in Extension::ALL {
+        assert_eq!(
+          task.max_items(extension),
+          ImageAnalysisTask::default_max_items(extension),
+          "{extension:?}"
+        );
+      }
+      for extension in LISTS {
+        let raised = full_task().with_max_items(extension, nz(20));
+        for other in Extension::ALL {
+          let expected = if other == extension {
+            Some(nz(20))
+          } else {
+            ImageAnalysisTask::default_max_items(other)
+          };
+          assert_eq!(
+            raised.max_items(other),
+            expected,
+            "{extension:?} set, {other:?} read"
+          );
+        }
+        assert_eq!(
+          raised.schema()["properties"][extension.as_str()]["maxItems"],
+          20
+        );
+
+        let mut task = ImageAnalysisTask::new().with_max_items(extension, nz(2));
+        task.set_extensions([extension]);
+        assert_eq!(
+          task.schema()["properties"][extension.as_str()]["maxItems"],
+          2
+        );
+        task.set_max_items(extension, nz(5));
+        assert_eq!(task.max_items(extension), Some(nz(5)));
+        assert_eq!(
+          task.schema()["properties"][extension.as_str()]["maxItems"],
+          5
+        );
+      }
+      for string in [Extension::Scene, Extension::ShotType] {
+        assert_eq!(ImageAnalysisTask::default_max_items(string), None);
+        let task = full_task().with_max_items(string, nz(4));
+        assert_eq!(task.max_items(string), None, "{string:?}");
+        assert_eq!(
+          task.schema(),
+          full_task().schema(),
+          "{string:?}: the schema is unchanged"
+        );
+      }
+    }
+
+    /// LAW (llmtask#18): **a list over its cap is read to its cap, `Capped`,
+    /// never refused.** Fifty categories under a cap of 8 are the first 8 as
+    /// written; every list — each list extension and `tags` — at its default
+    /// cap and at others keeps its first `cap` labels and drops the rest.
+    #[test]
+    fn a_list_over_its_cap_is_read_to_its_cap_and_capped() {
+      let fifty: Vec<String> = (0..50).map(|n| format!("category {n}")).collect();
+      let task = ImageAnalysisTask::new()
+        .with_extensions([Extension::Categories])
+        .with_max_items(Extension::Categories, nz(8));
+      let analysis = task
+        .parse(&list_answer(Extension::Categories, &fifty))
+        .expect("a list over its cap is read to it");
+      let first_eight: Vec<&str> = fifty[..8].iter().map(String::as_str).collect();
+      assert_eq!(read(&analysis, Extension::Categories), first_eight);
+      assert_eq!(analysis.categories_end(), ListEnd::Capped);
+
+      for extension in LISTS {
+        let default = ImageAnalysisTask::default_max_items(extension).expect("a list is capped");
+        for cap in [default.get(), 1, 12] {
+          let task = ImageAnalysisTask::new()
+            .with_extensions([extension])
+            .with_max_items(extension, nz(cap));
+          let labels: Vec<String> = (0..cap + 7).map(|n| format!("label {n}")).collect();
+          let analysis = task
+            .parse(&list_answer(extension, &labels))
+            .unwrap_or_else(|err| panic!("{extension:?} at {cap}: {err:?}"));
+          let kept: Vec<&str> = labels[..cap].iter().map(String::as_str).collect();
+          assert_eq!(read(&analysis, extension), kept, "{extension:?} at {cap}");
+          assert_eq!(
+            list_end(&analysis, extension),
+            ListEnd::Capped,
+            "{extension:?} at {cap}"
+          );
+        }
+      }
+      for cap in [ImageAnalysisTask::DEFAULT_TAGS_MAX_ITEMS.get(), 1, 12] {
+        let task = ImageAnalysisTask::new().with_tags_max_items(nz(cap));
+        let labels: Vec<String> = (0..cap + 7).map(|n| format!("tag {n}")).collect();
+        let analysis = task
+          .parse(&tags_answer(&labels))
+          .unwrap_or_else(|err| panic!("tags at {cap}: {err:?}"));
+        let kept: Vec<&str> = labels[..cap].iter().map(String::as_str).collect();
+        assert_eq!(tag_labels(&analysis), kept, "tags at {cap}");
+        assert_eq!(analysis.tags_end(), ListEnd::Capped, "tags at {cap}");
+      }
+    }
+
+    /// LAW: **a list ends `Capped` once the answer lists its cap's count, and
+    /// `Whole` short of it.** The cap counts the elements as the answer wrote
+    /// them, as the schema's `maxItems` does, before labels are trimmed and
+    /// deduplicated: a duplicate or a blank element takes its place under the
+    /// cap.
+    #[test]
+    fn a_list_is_capped_at_its_cap_and_whole_short_of_it() {
+      let cases: [(&[&str], &[&str], ListEnd); 9] = [
+        (&[], &[], ListEnd::Whole),
+        (&["a"], &["a"], ListEnd::Whole),
+        (&["a", "b"], &["a", "b"], ListEnd::Whole),
+        (&["a", "a"], &["a"], ListEnd::Whole),
+        (&["a", "b", "c"], &["a", "b", "c"], ListEnd::Capped),
+        (&["a", "b", "c", "d"], &["a", "b", "c"], ListEnd::Capped),
+        (&["a", "a", "b"], &["a", "b"], ListEnd::Capped),
+        (&["a", "a", "b", "c"], &["a", "b"], ListEnd::Capped),
+        (&["", " ", "a", "b"], &["a"], ListEnd::Capped),
+      ];
+      for extension in LISTS {
+        let task = ImageAnalysisTask::new()
+          .with_extensions([extension])
+          .with_max_items(extension, nz(3));
+        for (written, kept, end) in cases {
+          let written: Vec<String> = written.iter().map(|label| String::from(*label)).collect();
+          let analysis = task
+            .parse(&list_answer(extension, &written))
+            .unwrap_or_else(|err| panic!("{extension:?} {written:?}: {err:?}"));
+          assert_eq!(
+            read(&analysis, extension),
+            kept,
+            "{extension:?} {written:?}"
+          );
+          assert_eq!(
+            list_end(&analysis, extension),
+            end,
+            "{extension:?} {written:?}"
+          );
+        }
+      }
+      // `tags` too; an empty `tags` is let through the indexable-content gate.
+      let task = ImageAnalysisTask::new()
+        .with_tags_max_items(nz(3))
+        .with_accept_empty(true);
+      for (written, kept, end) in cases {
+        let written: Vec<String> = written.iter().map(|label| String::from(*label)).collect();
+        let analysis = task
+          .parse(&tags_answer(&written))
+          .unwrap_or_else(|err| panic!("tags {written:?}: {err:?}"));
+        assert_eq!(tag_labels(&analysis), kept, "tags {written:?}");
+        assert_eq!(analysis.tags_end(), end, "tags {written:?}");
+      }
+    }
+
+    /// LAW: **the description keeps its refusal; every list, `tags`
+    /// included, is capped and marked.** `description` and `tags` state their
+    /// caps as they did. An answer over the description's `maxLength` is
+    /// refused by name whatever its lists hold; `tags` over its `maxItems` is
+    /// read to its cap and `Capped`, as a list extension over its own is. A
+    /// cut inside or after the description is not JSON; a cut inside `tags`
+    /// is read as a cut inside any list is.
+    #[test]
+    fn the_description_keeps_its_refusal_and_every_list_is_capped() {
+      for task in [ImageAnalysisTask::new(), full_task()] {
+        let task = task
+          .with_description_max_chars(nz(10))
+          .with_tags_max_items(nz(2));
+        let properties = &task.schema()["properties"];
+        assert_eq!(
+          properties["description"],
+          json!({ "type": "string", "maxLength": 10 })
+        );
+        assert_eq!(
+          properties["tags"],
+          json!({ "type": "array", "items": { "type": "string" }, "maxItems": 2 })
+        );
+      }
+
+      let task = ImageAnalysisTask::new()
+        .with_extensions([Extension::Categories])
+        .with_description_max_chars(nz(20))
+        .with_tags_max_items(nz(2));
+      let lists =
+        r#""tags":["reading","book","lamp"],"categories":["home","leisure","indoor","quiet"]"#;
+      let analysis = task
+        .parse(&format!(r#"{{"description":"A person reads.",{lists}}}"#))
+        .expect("every list over its cap is read to it");
+      assert_eq!(analysis.tags(), ["reading", "book"]);
+      assert_eq!(analysis.tags_end(), ListEnd::Capped);
+      assert_eq!(analysis.categories(), ["home", "leisure", "indoor"]);
+      assert_eq!(analysis.categories_end(), ListEnd::Capped);
+      match task.parse(&format!(
+        r#"{{"description":"A person reads by the window.",{lists}}}"#
+      )) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["description"]),
+        other => {
+          panic!("the description over its cap must be refused by name alone, got {other:?}")
+        }
+      }
+
+      for cut in [
+        r#"{"description":"A person re"#,
+        r#"{"description":"A person reads."#,
+      ] {
+        assert!(
+          matches!(task.parse(cut), Err(JsonParseError::Json(_))),
+          "{cut} is not JSON"
+        );
+      }
+      match task.parse(r#"{"description":"A person reads.","tags":["reading","bo"#) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["categories"]),
+        other => panic!("a cut inside tags leaves categories unwritten, got {other:?}"),
+      }
+      let analysis = ImageAnalysisTask::new()
+        .parse(r#"{"description":"A person reads.","tags":["reading","bo"#)
+        .expect("on the default task, tags is the last field");
+      assert_eq!(analysis.tags(), ["reading"]);
+      assert_eq!(analysis.tags_end(), ListEnd::Capped);
+    }
+
+    /// The answer `an_answer_cut_inside_a_list_keeps_the_items_written_whole`
+    /// cuts: the full roster in field order — the order an engine writes the
+    /// schema's members in — each list holding labels with escapes and a
+    /// two-byte character.
+    const WRITTEN: &str = r#"{"scene":"office","description":"People work at their desks.","subjects":["office worker","visitor \"guest\""],"objects":["desk","caf\u00e9 cup","lamp"],"actions":["typing"],"emotion":["calm","focused"],"shot_type":"wide","lighting":["daylight","é"],"tags":["office","work"],"categories":["work","busi\\ness"]}"#;
+
+    /// One list's array in [`WRITTEN`]: its field, the bytes of its `[` and
+    /// its `]`, and each label it holds with the byte just past it.
+    struct WrittenList {
+      field: Field,
+      open: usize,
+      close: usize,
+      labels: Vec<(String, usize)>,
+    }
+
+    /// Every list's array in [`WRITTEN`], `tags` among them, read by
+    /// serde_json.
+    fn written_lists() -> Vec<WrittenList> {
+      Field::ALL
+        .into_iter()
+        .filter(|field| field.shape() == Shape::StringArray)
+        .map(|field| {
+          let open = WRITTEN
+            .find(&format!(r#""{}":["#, field.key()))
+            .expect("the list is written")
+            + field.key().len()
+            + 3;
+          let mut stream =
+            serde_json::Deserializer::from_str(&WRITTEN[open..]).into_iter::<Vec<&RawValue>>();
+          let items = stream
+            .next()
+            .expect("an array")
+            .expect("a JSON array of values");
+          let close = open + stream.byte_offset() - 1;
+          let labels = items
+            .into_iter()
+            .map(|item| {
+              let start = item.get().as_ptr() as usize - WRITTEN.as_ptr() as usize;
+              let label: String = serde_json::from_str(item.get()).expect("a string");
+              (label, start + item.get().len())
+            })
+            .collect();
+          WrittenList {
+            field,
+            open,
+            close,
+            labels,
+          }
+        })
+        .collect()
+    }
+
+    /// LAW (llmtask#18): **an answer cut off inside a list keeps the labels
+    /// written whole; any other cut is refused.** Every prefix of a
+    /// full-roster answer, cut at each character boundary:
+    ///
+    /// - inside `categories`' array, the answer's last field: it parses,
+    ///   `categories` holding the labels written whole before the cut,
+    ///   `Capped`, and every other field read as the whole answer reads it;
+    /// - inside another list's array, `tags` included: the fields after it
+    ///   are unwritten, `MissingFields` naming exactly those;
+    /// - anywhere else — before the object opens, in a key or before its
+    ///   value, inside or after a string field, after a list's own `]`:
+    ///   `Json`.
+    #[test]
+    fn an_answer_cut_inside_a_list_keeps_the_items_written_whole() {
+      let task = full_task();
+      let whole = task.parse(WRITTEN).expect("the whole answer parses");
+      assert_eq!(whole.categories(), ["work", "busi\\ness"]);
+      assert_eq!(whole.categories_end(), ListEnd::Whole);
+      let lists = written_lists();
+      // How many cuts each rule took: read, refused by name, not JSON.
+      let mut taken = [0_usize; 3];
+      let cuts = (0..WRITTEN.len()).filter(|&cut| WRITTEN.is_char_boundary(cut));
+      for cut in cuts {
+        let answer = &WRITTEN[..cut];
+        let parsed = task.parse(answer);
+        match lists
+          .iter()
+          .find(|list| list.open < cut && cut <= list.close)
+        {
+          Some(list) if list.field == Field::Categories => {
+            taken[0] += 1;
+            let analysis = parsed.unwrap_or_else(|err| panic!("{answer:?} must parse: {err:?}"));
+            let kept: Vec<&str> = list
+              .labels
+              .iter()
+              .filter(|(_, end)| *end <= cut)
+              .map(|(label, _)| label.as_str())
+              .collect();
+            assert_eq!(read(&analysis, Extension::Categories), kept, "{answer:?}");
+            assert_eq!(analysis.categories_end(), ListEnd::Capped, "{answer:?}");
+            let restored = analysis
+              .with_categories(whole.categories().to_vec())
+              .with_categories_end(whole.categories_end());
+            assert_eq!(restored, whole, "{answer:?}: every other field as written");
+          }
+          Some(list) => {
+            taken[1] += 1;
+            let unwritten: Vec<&str> = Field::ALL
+              .into_iter()
+              .skip_while(|&field| field != list.field)
+              .skip(1)
+              .map(Field::key)
+              .collect();
+            match parsed {
+              Err(JsonParseError::MissingFields(fields)) => {
+                assert_eq!(fields, unwritten, "{answer:?}")
+              }
+              other => panic!("{answer:?} must name the unwritten fields, got {other:?}"),
+            }
+          }
+          None => {
+            taken[2] += 1;
+            assert!(
+              matches!(parsed, Err(JsonParseError::Json(_))),
+              "{answer:?} is not JSON, got {parsed:?}"
+            );
+          }
+        }
+      }
+      assert!(
+        taken.iter().all(|&cuts| cuts > 0),
+        "every rule takes a cut: {taken:?}"
+      );
+    }
+
+    /// LAW (llmtask#18): **a list cut mid-item keeps the items before it.**
+    /// `categories` cut inside its third label keeps the two before it,
+    /// `Capped`, and the answer's other fields read as written.
+    #[test]
+    fn a_list_cut_mid_item_keeps_the_items_before_it() {
+      let task = ImageAnalysisTask::new().with_extensions([Extension::Categories]);
+      let analysis = task
+        .parse(r#"{"description":"A person reads by a window.","tags":["reading"],"categories":["home","leisure","indo"#)
+        .expect("a cut inside the last list is read to its whole items");
+      assert_eq!(analysis.categories(), ["home", "leisure"]);
+      assert_eq!(analysis.categories_end(), ListEnd::Capped);
+      assert_eq!(analysis.description(), "A person reads by a window.");
+      assert_eq!(analysis.tags(), ["reading"]);
+    }
+
+    /// LAW: **a cut answer is closed, then held to every check; a cut it
+    /// cannot be closed at is not JSON.** Closed after the cut list's last
+    /// whole item, an answer that leaves a field it asks for unwritten is
+    /// `MissingFields` naming it — a cut inside `tags` as inside any list —
+    /// and an undeclared key, a duplicated key or a label of another type
+    /// before the cut is refused as in any answer. A cut inside an item that
+    /// is not a string, after a list's own `]`, in a key, inside the
+    /// description, or inside a list the task does not ask for, is not JSON;
+    /// and so is a cut answer that is not JSON before the cut.
+    #[test]
+    fn a_cut_answer_is_refused_by_name_or_is_not_json() {
+      let task =
+        ImageAnalysisTask::new().with_extensions([Extension::Subjects, Extension::Categories]);
+      let head = r#"{"description":"A person reads.","tags":["reading"],"subjects":[],"#;
+      match task.parse(r#"{"description":"A person reads.","subjects":["reader","ca"#) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["tags", "categories"]),
+        other => panic!("expected the unwritten fields named, got {other:?}"),
+      }
+      match task.parse(r#"{"description":"A person reads.","tags":["rea"#) {
+        Err(JsonParseError::MissingFields(fields)) => {
+          assert_eq!(fields, ["subjects", "categories"])
+        }
+        other => panic!("a cut inside tags names the fields after it, got {other:?}"),
+      }
+      match task.parse(&format!(r#"{head}"extra":1,"categories":["ho"#)) {
+        Err(JsonParseError::UnknownFields(fields)) => assert_eq!(fields, ["extra"]),
+        other => panic!("expected UnknownFields naming extra, got {other:?}"),
+      }
+      match task.parse(&format!(r#"{head}"categories":["home"],"categories":["ho"#)) {
+        Err(JsonParseError::DuplicateField(key)) => assert_eq!(key, "categories"),
+        other => panic!("expected DuplicateField naming categories, got {other:?}"),
+      }
+      match task.parse(&format!(r#"{head}"categories":["home",7,"ind"#)) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields, ["categories"]),
+        other => panic!("expected MissingFields naming categories, got {other:?}"),
+      }
+      for cut in [
+        format!(r#"{head}"categories":["home",7"#),
+        format!(r#"{head}"categories":["home",tr"#),
+        format!(r#"{head}"categories":["home",["in"#),
+        format!(r#"{head}"categories":["home"]"#),
+        format!(r#"{head}"categ"#),
+        format!(r#"{head}"categories""#),
+        format!(r#"{head}"categories":"#),
+        String::from(r#"{"description":"A person re"#),
+        format!(r#"{head}"categories":["\uD800","ho"#),
+        String::from(r#"["home","#),
+      ] {
+        assert!(
+          matches!(task.parse(&cut), Err(JsonParseError::Json(_))),
+          "{cut} is not JSON"
+        );
+      }
+      assert!(
+        matches!(
+          ImageAnalysisTask::new()
+            .parse(r#"{"description":"A person reads.","tags":["reading"],"categories":["ho"#),
+          Err(JsonParseError::Json(_))
+        ),
+        "a list the task does not ask for is not read"
+      );
+    }
+
+    /// LAW: **a list's end needs no account.** `parse_ended` and
+    /// `parse_with_description_end` read every list as `parse` does — under,
+    /// at and over its cap, and cut off inside it — whatever accounts they
+    /// are handed: the analyses differ in the description's mark alone.
+    #[test]
+    fn the_decoders_account_changes_no_list() {
+      let task = full_task()
+        .with_max_items(Extension::Objects, nz(2))
+        .with_tags_max_items(nz(1));
+      let mut ends = FieldEnds::new();
+      ends.insert(
+        "description",
+        FieldEnd::model("People work at their desks."),
+      );
+      ends.insert("categories", FieldEnd::cap("work"));
+      ends.insert("tags", FieldEnd::cap("office"));
+      let description = FieldEnd::model("People work at their desks.");
+      for answer in [WRITTEN, &WRITTEN[..WRITTEN.len() - 10]] {
+        let parsed = task.parse(answer).expect("the answer parses");
+        assert_eq!(
+          parsed.objects_end(),
+          ListEnd::Capped,
+          "three objects under a cap of 2"
+        );
+        assert_eq!(
+          parsed.tags_end(),
+          ListEnd::Capped,
+          "two tags under a cap of 1"
+        );
+        for other in [
+          task.parse_ended(answer, &ends).expect("the answer parses"),
+          task
+            .parse_with_description_end(answer, &description)
+            .expect("the answer parses"),
+        ] {
+          assert_eq!(other.description_end(), DescriptionEnd::Whole);
+          assert_eq!(other.with_description_end(DescriptionEnd::Unknown), parsed);
+        }
       }
     }
   }

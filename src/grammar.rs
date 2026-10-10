@@ -52,11 +52,17 @@ pub enum Grammar {
   /// must honour every keyword its schema uses: `type`, `properties`,
   /// `required`, `additionalProperties: false`, `items`, `maxLength`
   /// (a string's length in Unicode scalar values) and `maxItems` (an
-  /// array's element count). The task's `parse` holds the answer to the
-  /// same keywords and to nothing looser, so it returns `Ok` only for an
-  /// answer the schema accepts: a JSON text, with nothing but JSON
-  /// whitespace around its value, in which every field has exactly the
-  /// JSON type the schema declares for it. A string where the schema
+  /// array's element count). The schema uses no other: an engine refuses a
+  /// schema with a keyword it does not implement. The task's `parse` holds
+  /// the answer to the same keywords and to nothing looser, so it returns
+  /// `Ok` only for an answer the schema accepts — or one its list rule
+  /// brings to the schema, every such list marked `Capped`: a list
+  /// extension over its `maxItems` is read to its cap, and an answer cut
+  /// off inside a list extension's array is closed after the list's last
+  /// whole item (see `ImageAnalysisTask`). An answer the schema accepts is
+  /// a JSON text, with nothing but JSON whitespace around its value, in
+  /// which every field has exactly the JSON type the schema declares for
+  /// it. A string where the schema
   /// declares an array of strings (a comma-separated list included) and an
   /// array where it declares a string (a one-element array included) are
   /// refused like any other violation, by name, as
@@ -65,16 +71,18 @@ pub enum Grammar {
   /// [`JsonParseError::UnknownFields`](crate::JsonParseError::UnknownFields).
   /// A decoder that enforces this schema never produces such a shape, so
   /// `parse` tolerates none, and an engine that ignores a keyword surfaces
-  /// as a parse error rather than as silently over-long or reshaped output.
+  /// as a parse error — or, for a list extension's `maxItems`, as a list
+  /// marked `Capped` — rather than as silently over-long or reshaped output.
   ///
   /// Only an answer that is not a JSON text is
   /// [`JsonParseError::Json`](crate::JsonParseError::Json): text serde_json's
   /// grammar rejects, or a string that escapes one half of a UTF-16
   /// surrogate pair (`\uD800` alone), which no Unicode text can hold,
-  /// wherever that string sits. Every other answer reaches the checks above
-  /// whole, however large or small its numbers and however deep its
-  /// nesting: `1e400` where a string is declared is `MissingFields` naming
-  /// the field, and under an undeclared key it is `UnknownFields`.
+  /// wherever that string sits — except an answer cut off inside a list
+  /// extension's array, which is read as above. Every other answer reaches
+  /// the checks above whole, however large or small its numbers and however
+  /// deep its nesting: `1e400` where a string is declared is `MissingFields`
+  /// naming the field, and under an undeclared key it is `UnknownFields`.
   #[cfg(feature = "json")]
   #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
   JsonSchema(serde_json::Value),

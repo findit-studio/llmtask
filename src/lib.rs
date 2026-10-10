@@ -25,7 +25,7 @@ pub mod task;
 pub use grammar::{Grammar, UnsupportedGrammar};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-pub use image_analysis::{DescriptionEnd, ImageAnalysis};
+pub use image_analysis::{DescriptionEnd, ImageAnalysis, ListEnd};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub use task::{FieldCaps, FieldEnd, FieldEnds, Task};

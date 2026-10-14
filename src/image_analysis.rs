@@ -912,19 +912,20 @@ mod tests {
 
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-pub use image_analysis_task::{Extension, ImageAnalysisTask, UnknownExtension};
+pub use image_analysis_task::{Extension, ImageAnalysisTask, InvalidTemplate, UnknownExtension};
 
 /// The `ImageAnalysisTask` implementation. Grouped in its own private
 /// module (mirroring `task::json`'s pattern) so the whole surface —
-/// struct, impls, the prompt/schema consts, and the parser's helper
-/// functions — shares one `#[cfg(feature = "json")]` gate on the `mod`
-/// line instead of repeating it on every item.
+/// struct, impls, the prompt template and its parser, and the answer
+/// parser's helper functions — shares one `#[cfg(feature = "json")]` gate
+/// on the `mod` line instead of repeating it on every item.
 #[cfg(feature = "json")]
 mod image_analysis_task {
   use core::{
     cell::RefCell,
     fmt::{self, Write as _},
     num::NonZeroUsize,
+    ops::Range,
     str::FromStr,
   };
 
@@ -942,28 +943,10 @@ mod image_analysis_task {
     task::{FieldCaps, FieldEnd, FieldEnds, JsonParseError, Task},
   };
 
-  /// The prompt's opening, before one paragraph per field the task asks
-  /// for (see `ImageAnalysisTask::build_prompt`).
-  const PROMPT_HEAD: &str = r#"Analyze the following video keyframes (in chronological order) from a single scene.
-
-Return ONLY a valid JSON object with exactly these fields:
-"#;
-
-  /// The prompt's closing rules, after the field paragraphs. They hold for
-  /// every roster: the label discipline speaks to whichever array fields
-  /// the task asks for, and `tags` is always one of them.
-  const PROMPT_RULES: &str = r#"
-Rules:
-- Use only information supported by the keyframes.
-- Prefer concrete visual facts over speculation.
-- Every array field's elements are lowercase, singular, 1-3-word phrases, with no trailing punctuation.
-- Keep arrays deduplicated.
-- Use empty arrays or empty strings when a field is unknown.
-- Do not return markdown or any text outside the JSON object."#;
-
   /// The ten fields of the image-analysis JSON contract, in
   /// [`ImageAnalysis`] field order: the order a task's schema requires
-  /// them in, its prompt describes them in, and its `parse` names them in.
+  /// them in, its default prompt describes them in, and its `parse` names
+  /// them in.
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   enum Field {
     Scene,
@@ -1043,10 +1026,12 @@ Rules:
   /// `description` and `tags` are not extensions: every task asks for
   /// them, because they are the indexable content search consumes.
   /// Switching an extension on adds its field to the task's schema
-  /// (`properties` and `required`) and its paragraph to the prompt, and
-  /// makes `parse` require and read the field. While it is off, the field
-  /// is in none of the three: an answer that carries it anyway is refused
-  /// as [`JsonParseError::UnknownFields`], and the parsed [`ImageAnalysis`]
+  /// (`properties` and `required`) and its line to the prompt, where the
+  /// prompt template places it (see
+  /// [`ImageAnalysisTask::with_prompt_template`]), and makes `parse` require
+  /// and read the field. While it is off, the field is in none of the
+  /// three: an answer that carries it anyway is refused as
+  /// [`JsonParseError::UnknownFields`], and the parsed [`ImageAnalysis`]
   /// reads it as empty.
   ///
   /// # Names
@@ -1184,6 +1169,30 @@ Rules:
     const fn bit(self) -> u8 {
       1 << (self as u8)
     }
+
+    /// The line of the prompt that describes this extension's field, without
+    /// its newline: what the extension's placeholder renders while the
+    /// extension is on. It reads the same in every roster.
+    const fn prompt_line(self) -> &'static str {
+      match self {
+        Self::Scene => {
+          "scene: a single short scene-category label in lowercase English, 1-3 words, no full sentence."
+        }
+        Self::Subjects => {
+          "subjects: array of distinct people or animals with visible distinguishing features."
+        }
+        Self::Objects => "objects: array of notable, search-relevant objects.",
+        Self::Actions => "actions: array of visible actions.",
+        Self::Emotion => "emotion: array of descriptors for the scene's overall emotional tone.",
+        Self::ShotType => {
+          "shot_type: a single short camera-shot label in lowercase English, 1-2 words (a cinematography term)."
+        }
+        Self::Lighting => "lighting: array of lighting descriptors.",
+        Self::Categories => {
+          "categories: array of broad content categories, coarser-grained than tags."
+        }
+      }
+    }
   }
 
   impl fmt::Display for Extension {
@@ -1301,6 +1310,184 @@ Rules:
     }
   }
 
+  /// The error [`ImageAnalysisTask::with_prompt_template`] and
+  /// [`ImageAnalysisTask::set_prompt_template`] return for a text that is not
+  /// a prompt template, named for what is wrong with it. A template is read
+  /// from its start, and the first fault in it is the one named.
+  #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+  pub enum InvalidTemplate {
+    /// The template is empty or holds only whitespace: it would tell the
+    /// model nothing.
+    #[error("the prompt template is empty")]
+    Empty,
+    /// A placeholder names none of the values a template renders. The
+    /// message lists every name a placeholder may hold.
+    #[error(
+      "unknown prompt-template placeholder {name:?}: expected one of {known}; \
+       a literal brace is written {{{{ or }}}}",
+      known = PlaceholderList
+    )]
+    UnknownPlaceholder {
+      /// The text between the braces, exactly as written.
+      name: SmolStr,
+    },
+    /// A brace that is neither part of a placeholder nor doubled: a `{` that
+    /// no `}` closes before the next brace, or a `}` that closes no `{`.
+    #[error(
+      "unbalanced {brace:?} at byte {offset} of the prompt template: a placeholder \
+       is written {{name}}, and a literal brace {{{{ or }}}}"
+    )]
+    UnbalancedBrace {
+      /// The brace, `{` or `}`.
+      brace: char,
+      /// The brace's byte offset in the template.
+      offset: usize,
+    },
+  }
+
+  /// A value a prompt template names between braces; see
+  /// [`ImageAnalysisTask::with_prompt_template`] for what each renders.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  enum Placeholder {
+    /// `{description_max_chars}`.
+    DescriptionMaxChars,
+    /// `{tags_max_items}`.
+    TagsMaxItems,
+    /// `{extensions}`.
+    Extensions,
+    /// The extension's name: `{scene}`, `{subjects}` and the rest.
+    Extension(Extension),
+  }
+
+  impl Placeholder {
+    /// Every placeholder, in the order [`InvalidTemplate`] lists their names:
+    /// the caps, `extensions`, then each extension in [`Extension::ALL`]
+    /// order.
+    const ALL: [Self; 3 + Extension::ALL.len()] = {
+      let mut all = [Self::DescriptionMaxChars; 3 + Extension::ALL.len()];
+      all[1] = Self::TagsMaxItems;
+      all[2] = Self::Extensions;
+      let mut index = 0;
+      while index < Extension::ALL.len() {
+        all[3 + index] = Self::Extension(Extension::ALL[index]);
+        index += 1;
+      }
+      all
+    };
+
+    /// The name a template writes between the braces.
+    const fn name(self) -> &'static str {
+      match self {
+        Self::DescriptionMaxChars => "description_max_chars",
+        Self::TagsMaxItems => "tags_max_items",
+        Self::Extensions => "extensions",
+        Self::Extension(extension) => extension.as_str(),
+      }
+    }
+
+    /// The placeholder named `name`, read exactly as written.
+    fn from_name(name: &str) -> Option<Self> {
+      Self::ALL
+        .into_iter()
+        .find(|placeholder| placeholder.name() == name)
+    }
+  }
+
+  /// [`Placeholder::ALL`] as [`InvalidTemplate`]'s message lists them: each
+  /// name in its braces, comma-separated, in order.
+  struct PlaceholderList;
+
+  impl fmt::Display for PlaceholderList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      for (index, placeholder) in Placeholder::ALL.into_iter().enumerate() {
+        if index > 0 {
+          f.write_str(", ")?;
+        }
+        write!(f, "{{{}}}", placeholder.name())?;
+      }
+      Ok(())
+    }
+  }
+
+  /// A prompt template, split into the pieces it renders as when it is set,
+  /// so that rendering it cannot fail.
+  #[derive(Clone)]
+  struct PromptTemplate {
+    text: SmolStr,
+    pieces: Vec<Piece>,
+  }
+
+  /// One piece of a [`PromptTemplate`].
+  #[derive(Clone)]
+  enum Piece {
+    /// The template's text over this byte range, written as it stands. A
+    /// doubled brace is the one brace it stands for: its range ends after
+    /// the first of the two.
+    Text(Range<usize>),
+    /// A placeholder, written as the task's value for it.
+    Placeholder(Placeholder),
+  }
+
+  impl PromptTemplate {
+    /// Splits `text` into its pieces, or names the first fault that makes it
+    /// no template.
+    fn parse(text: SmolStr) -> Result<Self, InvalidTemplate> {
+      if text.trim().is_empty() {
+        return Err(InvalidTemplate::Empty);
+      }
+      let source = text.as_str();
+      let bytes = source.as_bytes();
+      let mut pieces = Vec::new();
+      // Where the text not yet in a piece starts.
+      let mut start = 0;
+      let mut index = 0;
+      while let Some(&byte) = bytes.get(index) {
+        match byte {
+          // A doubled brace: the text up to and including its first brace.
+          b'{' | b'}' if bytes.get(index + 1) == Some(&byte) => {
+            pieces.push(Piece::Text(start..index + 1));
+            index += 2;
+            start = index;
+          }
+          b'{' => {
+            // The name runs to the next brace, which must close it.
+            let close = bytes[index + 1..]
+              .iter()
+              .position(|&next| next == b'{' || next == b'}')
+              .map(|len| index + 1 + len)
+              .filter(|&close| bytes[close] == b'}')
+              .ok_or(InvalidTemplate::UnbalancedBrace {
+                brace: '{',
+                offset: index,
+              })?;
+            let name = &source[index + 1..close];
+            let placeholder =
+              Placeholder::from_name(name).ok_or_else(|| InvalidTemplate::UnknownPlaceholder {
+                name: SmolStr::new(name),
+              })?;
+            if start < index {
+              pieces.push(Piece::Text(start..index));
+            }
+            pieces.push(Piece::Placeholder(placeholder));
+            index = close + 1;
+            start = index;
+          }
+          b'}' => {
+            return Err(InvalidTemplate::UnbalancedBrace {
+              brace: '}',
+              offset: index,
+            });
+          }
+          _ => index += 1,
+        }
+      }
+      if start < bytes.len() {
+        pieces.push(Piece::Text(start..bytes.len()));
+      }
+      Ok(Self { text, pieces })
+    }
+  }
+
   /// The image-analysis task: a prompt, a JSON Schema and a parser, all
   /// derived from one FIELD ROSTER.
   ///
@@ -1310,33 +1497,45 @@ Rules:
   /// [`ImageAnalysisTask::new`] asks for those two and nothing else; each
   /// of the other eight fields is an [`Extension`] a deployment switches on
   /// with [`with_extensions`](Self::with_extensions). The schema declares
-  /// and requires exactly the roster's fields, the prompt describes exactly
-  /// those, and [`parse`](Task::parse) requires exactly those and leaves
-  /// every other field of the returned [`ImageAnalysis`] empty.
+  /// and requires exactly the roster's fields, the default prompt describes
+  /// exactly those, and [`parse`](Task::parse) requires exactly those and
+  /// leaves every other field of the returned [`ImageAnalysis`] empty.
   ///
   /// Both caps are stated in the schema (`maxLength` on `description`,
-  /// `maxItems` on `tags`) and in the prompt. The constrained decoder
-  /// enforces the schema, caps included, and `parse` holds the answer to
-  /// the same schema: the keyword contract is on [`Grammar::JsonSchema`],
-  /// and a field that breaks it is refused as
+  /// `maxItems` on `tags`) and in the default prompt. The constrained
+  /// decoder enforces the schema, caps included, and `parse` holds the
+  /// answer to the same schema: the keyword contract is on
+  /// [`Grammar::JsonSchema`], and a field that breaks it is refused as
   /// [`JsonParseError::MissingFields`] naming the field. `parse` never
   /// rewrites the model's words to make them fit: a description over its
   /// cap is refused, and a list over its cap loses whole labels past it,
   /// never part of one.
   ///
+  /// # The prompt
+  ///
+  /// The prompt is rendered from a template, text with the task's caps and
+  /// extension lines in place of the placeholders it names, and rendered
+  /// again whenever the extensions or a cap change. Every task starts with
+  /// [`DEFAULT_PROMPT_TEMPLATE`](Self::DEFAULT_PROMPT_TEMPLATE), which
+  /// describes exactly the roster's fields and states both caps; a
+  /// deployment rewords the prompt with
+  /// [`with_prompt_template`](Self::with_prompt_template), which changes the
+  /// prompt and nothing else.
+  ///
   /// # The lists
   ///
   /// Every list the task asks for holds at most a cap of labels, stated in
   /// the schema as its `maxItems`: `tags` at most
-  /// [`tags_max_items`](Self::tags_max_items), which the prompt states too,
-  /// and each list extension — `subjects`, `objects`, `actions`, `emotion`,
-  /// `lighting` and `categories` — at most [`max_items`](Self::max_items),
-  /// which the prompt does not. A constrained decoder closes a list at its
-  /// cap however long the model would have gone on, so a model that keeps
-  /// appending labels cannot run the answer out of tokens inside one
-  /// (findit-studio/llmtask#18). The list extensions' caps default by what
-  /// each list holds ([`default_max_items`](Self::default_max_items)); a
-  /// deployment sets its own with [`with_max_items`](Self::with_max_items).
+  /// [`tags_max_items`](Self::tags_max_items), which the default prompt
+  /// states too, and each list extension — `subjects`, `objects`,
+  /// `actions`, `emotion`, `lighting` and `categories` — at most
+  /// [`max_items`](Self::max_items), which no prompt placeholder renders. A
+  /// constrained decoder closes a list at its cap however long the model
+  /// would have gone on, so a model that keeps appending labels cannot run
+  /// the answer out of tokens inside one (findit-studio/llmtask#18). The
+  /// list extensions' caps default by what each list holds
+  /// ([`default_max_items`](Self::default_max_items)); a deployment sets
+  /// its own with [`with_max_items`](Self::with_max_items).
   ///
   /// `parse` reads every list to its cap rather than refusing it. The list
   /// is read whole first, so an element that is not a string refuses the
@@ -1454,9 +1653,12 @@ Rules:
     // two string extensions.
     list_max_items: [Option<NonZeroUsize>; Extension::ALL.len()],
     accept_empty: bool,
+    // What `build_prompt` renders the prompt from.
+    template: PromptTemplate,
     // Both derived from `extensions` and the caps by `rebuild`, which every
     // setter of those calls, so the schema, the prompt and `parse` always
-    // describe the same roster.
+    // describe the same roster. The prompt is rendered from `template`, and
+    // rendered again by the template's setters.
     schema: Value,
     prompt: String,
   }
@@ -1473,6 +1675,41 @@ Rules:
     /// for keyword search to find a picture by its subject, setting and
     /// style, while keeping the answer short.
     pub const DEFAULT_TAGS_MAX_ITEMS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+
+    // The wording is the legacy findit-qwen service's prompt as the `lfm`
+    // and `qwen3-vl` copies of this task carried it, with `mood` renamed to
+    // `emotion`, a `categories` field added, and the per-field word-count
+    // guidance collapsed into the one label rule for every array field.
+    /// The template every task renders its prompt from until
+    /// [`with_prompt_template`](Self::with_prompt_template) sets another.
+    /// Rendered, it is the prompt llmtask 0.6.0 wrote, byte for byte, for
+    /// every roster and every cap: its opening, a line per field the task
+    /// asks for in [`ImageAnalysis`] field order (`description` and `tags`
+    /// stating their caps, each extension's line through its placeholder),
+    /// then the rules, which hold for every roster: the label rule speaks to
+    /// whichever array fields the task asks for, and `tags` is always one of
+    /// them.
+    ///
+    /// It names no example values. An engine whose sampler penalizes tokens
+    /// already in the context (a presence penalty over the prompt and the
+    /// answer, as mistralrs applies in its deterministic sampling) steers
+    /// the model away from any value a prompt enumerates, even where the
+    /// picture shows it, so the format guidance is descriptive (word counts,
+    /// lowercase, singular) rather than `e.g. "..."` examples. A template of
+    /// a deployment's own does well to keep to that.
+    pub const DEFAULT_PROMPT_TEMPLATE: &'static str = r#"Analyze the following video keyframes (in chronological order) from a single scene.
+
+Return ONLY a valid JSON object with exactly these fields:
+{scene}description: one concise sentence in English, at most {description_max_chars} characters, describing the stable visual facts across the scene. Cover who is present, what they are doing, the setting, and the overall mood or visual style. If readable on-screen text appears, quote that text first, then continue the description.
+{subjects}{objects}{actions}{emotion}{shot_type}{lighting}tags: array of at most {tags_max_items} short English search tags. Prefer high-confidence search terms, complementary synonyms, style words, and culture-specific terms only when visually supported.
+{categories}
+Rules:
+- Use only information supported by the keyframes.
+- Prefer concrete visual facts over speculation.
+- Every array field's elements are lowercase, singular, 1-3-word phrases, with no trailing punctuation.
+- Keep arrays deduplicated.
+- Use empty arrays or empty strings when a field is unknown.
+- Do not return markdown or any text outside the JSON object."#;
 
     /// [`Self::default_max_items`] of the lists that name one quality of the
     /// whole picture.
@@ -1507,7 +1744,8 @@ Rules:
     /// once it is) and `accept_empty = false` (a payload that lacks the
     /// required indexable content is treated as a model regression and
     /// rejected; see [`Self::with_accept_empty`] for the full predicate and
-    /// the opt-in alternative).
+    /// the opt-in alternative). Its prompt is rendered from
+    /// [`Self::DEFAULT_PROMPT_TEMPLATE`].
     pub fn new() -> Self {
       let mut task = Self {
         extensions: 0,
@@ -1515,6 +1753,8 @@ Rules:
         tags_max_items: Self::DEFAULT_TAGS_MAX_ITEMS,
         list_max_items: Extension::ALL.map(Self::default_max_items),
         accept_empty: false,
+        template: PromptTemplate::parse(SmolStr::new_static(Self::DEFAULT_PROMPT_TEMPLATE))
+          .expect("DEFAULT_PROMPT_TEMPLATE names only known placeholders and balances its braces"),
         schema: Value::Null,
         prompt: String::new(),
       };
@@ -1552,10 +1792,11 @@ Rules:
 
     /// The most characters `description` may hold, counted in Unicode
     /// scalar values (what JSON Schema's `maxLength` counts). Stated in the
-    /// schema as `maxLength` and in the prompt; `parse` refuses a longer
-    /// description by name, and settles the end of one that reached the cap
-    /// — where a constrained decoder closed it — recording what it did as
-    /// the analysis's [`DescriptionEnd`](crate::DescriptionEnd).
+    /// schema as `maxLength`, and in the prompt where its template writes
+    /// `{description_max_chars}`, as the default template does; `parse`
+    /// refuses a longer description by name, and settles the end of one that
+    /// reached the cap — where a constrained decoder closed it — recording
+    /// what it did as the analysis's [`DescriptionEnd`](crate::DescriptionEnd).
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn description_max_chars(&self) -> NonZeroUsize {
       self.description_max_chars
@@ -1576,9 +1817,10 @@ Rules:
       self
     }
 
-    /// The most labels `tags` may hold. Stated in the schema as `maxItems`
-    /// and in the prompt; `parse` reads a longer list to it and records how
-    /// the list ended as its [`ListEnd`].
+    /// The most labels `tags` may hold. Stated in the schema as `maxItems`,
+    /// and in the prompt where its template writes `{tags_max_items}`, as the
+    /// default template does; `parse` reads a longer list to it and records
+    /// how the list ended as its [`ListEnd`].
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn tags_max_items(&self) -> NonZeroUsize {
       self.tags_max_items
@@ -1603,7 +1845,8 @@ Rules:
     /// and `shot_type`, which are single strings. Stated in the schema as
     /// the list's `maxItems`, so a constrained decoder closes the list there;
     /// `parse` reads a longer list to it and records how the list ended as
-    /// its [`ListEnd`]. The prompt does not state it.
+    /// its [`ListEnd`]. The default prompt does not state it, and no
+    /// placeholder renders it.
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub const fn max_items(&self, extension: Extension) -> Option<NonZeroUsize> {
       self.list_max_items[extension as usize]
@@ -1628,6 +1871,131 @@ Rules:
         self.rebuild();
       }
       self
+    }
+
+    // --- prompt template ---
+
+    /// The template the task's [`prompt`](Task::prompt) is rendered from,
+    /// exactly as it was set: [`Self::DEFAULT_PROMPT_TEMPLATE`] until
+    /// [`with_prompt_template`](Self::with_prompt_template) sets another.
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    pub fn prompt_template(&self) -> &str {
+      &self.template.text
+    }
+
+    /// Builder-style setter for the prompt template: the text the task's
+    /// [`prompt`](Task::prompt) is rendered from, with the task's values in
+    /// place of the placeholders it names. The prompt is rendered now, and
+    /// again whenever the extensions or a cap change.
+    ///
+    /// | Placeholder | Renders |
+    /// | --- | --- |
+    /// | `{description_max_chars}` | [`description_max_chars`](Self::description_max_chars), a number |
+    /// | `{tags_max_items}` | [`tags_max_items`](Self::tags_max_items), a number |
+    /// | `{scene}`, `{subjects}`, `{objects}`, `{actions}`, `{emotion}`, `{shot_type}`, `{lighting}`, `{categories}` | while that [`Extension`] is on, the line that describes its field, then a newline; while it is off, nothing |
+    /// | `{extensions}` | every switched-on extension's line, each followed by a newline, in [`Extension::ALL`] order |
+    ///
+    /// A placeholder is a name from the table between braces, spelled
+    /// exactly as the table spells it, and it renders wherever it stands, as
+    /// often as it stands. `{{` and `}}` write a literal `{` and `}`: a
+    /// template that shows the model a JSON object doubles its braces. An
+    /// extension's placeholder renders a whole line or nothing, so it goes
+    /// at the start of the line it comes before:
+    /// [`Self::DEFAULT_PROMPT_TEMPLATE`] writes `{scene}description: …`, the
+    /// `scene` line above the `description` line while `scene` is on, and
+    /// the `description` line alone while it is off.
+    ///
+    /// The template words the prompt and nothing else. The schema and
+    /// [`parse`](Task::parse) follow the extensions and the caps, never the
+    /// prompt, and a constrained decoder holds the answer to the schema
+    /// whatever the prompt says: a template changes what the model is told,
+    /// not what `parse` accepts. A template that leaves out a switched-on
+    /// extension's line still has the schema require the field; the model is
+    /// only not told what it holds.
+    ///
+    /// A new template is a new [`prompt`](Task::prompt), as a new cap or a
+    /// new extension is: a consumer that folds the prompt into the identity
+    /// of what it derives, such as a cache key or a derivation identity,
+    /// derives anew under it.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidTemplate`], naming the fault, for a template that is empty
+    /// or only whitespace ([`Empty`](InvalidTemplate::Empty)), names a
+    /// placeholder the table does not hold
+    /// ([`UnknownPlaceholder`](InvalidTemplate::UnknownPlaceholder)), or has
+    /// a brace that is neither part of a placeholder nor doubled
+    /// ([`UnbalancedBrace`](InvalidTemplate::UnbalancedBrace)). The task is
+    /// consumed either way; [`set_prompt_template`](Self::set_prompt_template)
+    /// keeps it as it was on a refusal.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use core::num::NonZeroUsize;
+    ///
+    /// use llmtask::{
+    ///   Task,
+    ///   image_analysis::{Extension, ImageAnalysisTask, InvalidTemplate},
+    /// };
+    ///
+    /// let template = "Answer with one JSON object, {{\"description\": …, \"tags\": […]}}.\n\
+    ///                 {extensions}description: at most {description_max_chars} characters.\n\
+    ///                 tags: at most {tags_max_items} labels.";
+    /// let task = ImageAnalysisTask::new()
+    ///   .with_extensions([Extension::Scene])
+    ///   .with_prompt_template(template)
+    ///   .expect("every placeholder is known and every brace balanced");
+    /// assert_eq!(task.prompt_template(), template);
+    /// assert_eq!(
+    ///   task.prompt(),
+    ///   "Answer with one JSON object, {\"description\": …, \"tags\": […]}.\n\
+    ///    scene: a single short scene-category label in lowercase English, 1-3 words, no full sentence.\n\
+    ///    description: at most 120 characters.\n\
+    ///    tags: at most 8 labels.",
+    /// );
+    ///
+    /// // The prompt follows the caps and the extensions.
+    /// let task = task
+    ///   .with_tags_max_items(NonZeroUsize::new(5).unwrap())
+    ///   .with_extensions([]);
+    /// assert_eq!(
+    ///   task.prompt(),
+    ///   "Answer with one JSON object, {\"description\": …, \"tags\": […]}.\n\
+    ///    description: at most 120 characters.\n\
+    ///    tags: at most 5 labels.",
+    /// );
+    ///
+    /// // A placeholder the table does not hold is refused by its name.
+    /// assert_eq!(
+    ///   ImageAnalysisTask::new()
+    ///     .with_prompt_template("at most {description_max_char} characters")
+    ///     .err(),
+    ///   Some(InvalidTemplate::UnknownPlaceholder { name: "description_max_char".into() }),
+    /// );
+    /// ```
+    pub fn with_prompt_template(
+      mut self,
+      template: impl Into<SmolStr>,
+    ) -> Result<Self, InvalidTemplate> {
+      self.set_prompt_template(template)?;
+      Ok(self)
+    }
+
+    /// In-place setter for the prompt template. See
+    /// [`Self::with_prompt_template`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::with_prompt_template`]. A refused template leaves the
+    /// task as it was, its template and its prompt included.
+    pub fn set_prompt_template(
+      &mut self,
+      template: impl Into<SmolStr>,
+    ) -> Result<&mut Self, InvalidTemplate> {
+      self.template = PromptTemplate::parse(template.into())?;
+      self.prompt = self.build_prompt();
+      Ok(self)
     }
 
     // --- accept_empty ---
@@ -1665,9 +2033,9 @@ Rules:
     /// index.
     ///
     /// When `true`, the parser bypasses the indexable-content check and
-    /// returns whatever round-trips through the schema. The prompt's rules
-    /// tell the model to "Use empty arrays or empty strings when a field
-    /// is unknown", so on truly low-information frames (blank,
+    /// returns whatever round-trips through the schema. The default
+    /// prompt's rules tell the model to "Use empty arrays or empty strings
+    /// when a field is unknown", so on truly low-information frames (blank,
     /// fade-to-black, plain color) compliant model output can legitimately
     /// be sparse or fully-empty. Turn it on if your pipeline distinguishes
     /// "low-information scene" from "no useful content" via something
@@ -1738,8 +2106,8 @@ Rules:
 
   // ===== derivation from the roster =====
   impl ImageAnalysisTask {
-    /// Re-derives the schema and the prompt from the extensions and the
-    /// caps.
+    /// Re-derives the schema from the extensions and the caps, and renders
+    /// the prompt for them from the template.
     fn rebuild(&mut self) {
       self.schema = self.build_schema();
       self.prompt = self.build_prompt();
@@ -1829,76 +2197,50 @@ Rules:
         .and_then(|extension| self.max_items(extension))
     }
 
-    /// The prompt for the task: [`PROMPT_HEAD`], one paragraph per field
-    /// the task asks for (see [`Self::write_paragraph`]), then
-    /// [`PROMPT_RULES`].
-    ///
-    /// The wording is ported (structure and resilience-relevant wording)
-    /// from the two engine-side copies this task replaced —
-    /// `lfm/src/image_analysis.rs` and `qwen3-vl/src/image_analysis.rs`,
-    /// themselves a verbatim port of the legacy `findit-qwen` service's
-    /// prompt — with `mood` renamed to `emotion`, a `categories` field
-    /// added, and the per-field word-count guidance collapsed into one
-    /// discipline rule applied uniformly to every array field (see
-    /// [`PROMPT_RULES`]).
-    ///
-    /// Intentionally written WITHOUT enumerated example values. Both of
-    /// today's `llmtask` consumers (`lfm`, `qwen3-vl`) run on mistralrs,
-    /// whose deterministic/greedy sampling applies a `presence_penalty`
-    /// over the full context (prompt + generated tokens) — any
-    /// value-token the prompt enumerates as an example (e.g. "office",
-    /// "wide shot", "birthday cake with candles") gets a negative logit
-    /// shift before the model emits anything, biasing generation away
-    /// from that exact term even when a scene legitimately matches it.
-    /// `llmtask` itself has no engine dependency and doesn't assume this
-    /// mechanism is universal, but avoiding enumerated examples costs
-    /// nothing and is free insurance for any engine that behaves this
-    /// way — so format guidance stays in descriptive constraints (word
-    /// counts, lowercase, singular) instead of `e.g. "..."` examples.
+    /// The prompt for the task: its template rendered for its extensions and
+    /// caps (see [`Self::with_prompt_template`]).
     fn build_prompt(&self) -> String {
-      let mut prompt = String::from(PROMPT_HEAD);
-      for field in self.fields() {
-        // Writing into a `String` cannot fail.
-        let _ = self.write_paragraph(&mut prompt, field);
-        prompt.push('\n');
+      let text = self.template.text.as_str();
+      let mut prompt = String::with_capacity(text.len());
+      for piece in &self.template.pieces {
+        match piece {
+          Piece::Text(range) => prompt.push_str(&text[range.clone()]),
+          // Writing into a `String` cannot fail.
+          Piece::Placeholder(placeholder) => {
+            let _ = self.write_placeholder(&mut prompt, *placeholder);
+          }
+        }
       }
-      prompt.push_str(PROMPT_RULES);
       prompt
     }
 
-    /// Writes `field`'s paragraph of the prompt. An extension's paragraph
-    /// is the same whichever roster holds it. `description` and `tags`
-    /// state the task's caps: the description is one sentence of at most
-    /// `description_max_chars` characters, and `tags` lists at most
-    /// `tags_max_items` labels.
-    fn write_paragraph(&self, prompt: &mut String, field: Field) -> fmt::Result {
-      match field {
-        Field::Scene => prompt.write_str(
-          "scene: a single short scene-category label in lowercase English, 1-3 words, no full sentence.",
-        ),
-        Field::Description => write!(
-          prompt,
-          "description: one concise sentence in English, at most {} characters, describing the stable visual facts across the scene. Cover who is present, what they are doing, the setting, and the overall mood or visual style. If readable on-screen text appears, quote that text first, then continue the description.",
-          self.description_max_chars
-        ),
-        Field::Subjects => prompt.write_str(
-          "subjects: array of distinct people or animals with visible distinguishing features.",
-        ),
-        Field::Objects => prompt.write_str("objects: array of notable, search-relevant objects."),
-        Field::Actions => prompt.write_str("actions: array of visible actions."),
-        Field::Emotion => prompt
-          .write_str("emotion: array of descriptors for the scene's overall emotional tone."),
-        Field::ShotType => prompt.write_str(
-          "shot_type: a single short camera-shot label in lowercase English, 1-2 words (a cinematography term).",
-        ),
-        Field::Lighting => prompt.write_str("lighting: array of lighting descriptors."),
-        Field::Tags => write!(
-          prompt,
-          "tags: array of at most {} short English search tags. Prefer high-confidence search terms, complementary synonyms, style words, and culture-specific terms only when visually supported.",
-          self.tags_max_items
-        ),
-        Field::Categories => prompt
-          .write_str("categories: array of broad content categories, coarser-grained than tags."),
+    /// Writes the task's value for `placeholder`: a cap as its number; an
+    /// extension's line and a newline while the extension is on, and nothing
+    /// while it is off; for `{extensions}`, that of every extension in
+    /// [`Extension::ALL`] order.
+    fn write_placeholder(&self, prompt: &mut String, placeholder: Placeholder) -> fmt::Result {
+      match placeholder {
+        Placeholder::DescriptionMaxChars => write!(prompt, "{}", self.description_max_chars),
+        Placeholder::TagsMaxItems => write!(prompt, "{}", self.tags_max_items),
+        Placeholder::Extensions => {
+          for extension in Extension::ALL {
+            self.push_extension_line(prompt, extension);
+          }
+          Ok(())
+        }
+        Placeholder::Extension(extension) => {
+          self.push_extension_line(prompt, extension);
+          Ok(())
+        }
+      }
+    }
+
+    /// Pushes `extension`'s line of the prompt and a newline while the task
+    /// asks for its field, and nothing while it does not.
+    fn push_extension_line(&self, prompt: &mut String, extension: Extension) {
+      if self.has_extension(extension) {
+        prompt.push_str(extension.prompt_line());
+        prompt.push('\n');
       }
     }
 
@@ -2053,6 +2395,8 @@ Rules:
     type Value = Value;
     type ParseError = JsonParseError;
 
+    /// The prompt [`prompt_template`](ImageAnalysisTask::prompt_template)
+    /// renders for the task's extensions and caps.
     fn prompt(&self) -> &str {
       &self.prompt
     }
@@ -2214,8 +2558,8 @@ Rules:
           }
         };
       }
-      // Indexable-content gate. The prompt's rules instruct the model to
-      // "Use empty arrays or empty strings when a field is unknown",
+      // Indexable-content gate. The default prompt's rules instruct the
+      // model to "Use empty arrays or empty strings when a field is unknown",
       // so a truly compliant response on a blank/fade-to-black frame can
       // be partially or fully empty. But a decoder/model regression on a
       // normal frame also produces sparse output, and silently
@@ -2677,10 +3021,10 @@ Rules:
     // ===== ported from both engine copies (lfm + qwen3-vl; the two
     // copies' test suites were substantively identical) =====
 
-    /// The prompt must not enumerate value tokens — see
-    /// `ImageAnalysisTask::build_prompt` for the presence-penalty
-    /// rationale. The full roster's prompt holds every paragraph, so
-    /// checking it checks them all.
+    /// The default prompt must not enumerate value tokens — see
+    /// `ImageAnalysisTask::DEFAULT_PROMPT_TEMPLATE` for the
+    /// presence-penalty rationale. The full roster's prompt holds every
+    /// line, so checking it checks them all.
     #[test]
     fn scene_prompt_does_not_enumerate_value_tokens() {
       let prompt_lower = full_task().prompt().to_lowercase();
@@ -3562,8 +3906,9 @@ Rules:
       }
     }
 
-    /// Sealed discipline (see `PROMPT_RULES`, which closes every
-    /// roster's prompt): every array field's elements must be lowercase,
+    /// Sealed discipline (see the rules that close
+    /// `ImageAnalysisTask::DEFAULT_PROMPT_TEMPLATE`, and so every roster's
+    /// default prompt): every array field's elements must be lowercase,
     /// singular, 1-3-word phrases with no trailing punctuation — as a
     /// PROMPT instruction. This test pins the prompt text; the parser
     /// itself must never enforce it by transforming output (see
@@ -4076,6 +4421,365 @@ Rules:
           .prompt()
           .contains("at most 3 short English search tags")
       );
+    }
+
+    // ===== the prompt template =====
+
+    /// `extension`'s line of the prompt and its newline, as 0.6.0 wrote
+    /// them.
+    fn line(extension: Extension) -> String {
+      let (_, paragraph) = EXTENSION_PARAGRAPHS
+        .into_iter()
+        .find(|&(each, _)| each == extension)
+        .expect("every extension has its paragraph");
+      format!("{paragraph}\n")
+    }
+
+    /// The prompt llmtask 0.6.0 wrote for `task`, verbatim from 0.6.0's
+    /// `PROMPT_HEAD`, `write_paragraph` and `PROMPT_RULES`: the head, then a
+    /// paragraph and a newline per field the task asks for, in field order,
+    /// then the rules. The laws below hold the default template to it.
+    fn prompt_0_6_0(task: &ImageAnalysisTask) -> String {
+      const PROMPT_HEAD: &str = r#"Analyze the following video keyframes (in chronological order) from a single scene.
+
+Return ONLY a valid JSON object with exactly these fields:
+"#;
+      const PROMPT_RULES: &str = r#"
+Rules:
+- Use only information supported by the keyframes.
+- Prefer concrete visual facts over speculation.
+- Every array field's elements are lowercase, singular, 1-3-word phrases, with no trailing punctuation.
+- Keep arrays deduplicated.
+- Use empty arrays or empty strings when a field is unknown.
+- Do not return markdown or any text outside the JSON object."#;
+      let description = format!(
+        "description: one concise sentence in English, at most {} characters, describing the stable visual facts across the scene. Cover who is present, what they are doing, the setting, and the overall mood or visual style. If readable on-screen text appears, quote that text first, then continue the description.\n",
+        task.description_max_chars()
+      );
+      let tags = format!(
+        "tags: array of at most {} short English search tags. Prefer high-confidence search terms, complementary synonyms, style words, and culture-specific terms only when visually supported.\n",
+        task.tags_max_items()
+      );
+      let paragraph = |extension: Extension| {
+        if task.has_extension(extension) {
+          line(extension)
+        } else {
+          String::new()
+        }
+      };
+      let mut prompt = String::from(PROMPT_HEAD);
+      for paragraph in [
+        paragraph(Extension::Scene),
+        description,
+        paragraph(Extension::Subjects),
+        paragraph(Extension::Objects),
+        paragraph(Extension::Actions),
+        paragraph(Extension::Emotion),
+        paragraph(Extension::ShotType),
+        paragraph(Extension::Lighting),
+        tags,
+        paragraph(Extension::Categories),
+      ] {
+        prompt.push_str(&paragraph);
+      }
+      prompt.push_str(PROMPT_RULES);
+      prompt
+    }
+
+    /// LAW: the default template renders the prompt 0.6.0 wrote, byte for
+    /// byte, for every roster (each of the 256 sets of extensions), at the
+    /// default caps and at moved ones: a task that never sets a template
+    /// keeps its prompt.
+    #[test]
+    fn the_default_template_renders_the_0_6_0_prompt_for_every_roster_and_cap() {
+      let caps = [
+        (
+          ImageAnalysisTask::DEFAULT_DESCRIPTION_MAX_CHARS,
+          ImageAnalysisTask::DEFAULT_TAGS_MAX_ITEMS,
+        ),
+        (nz(1), nz(1)),
+        (nz(40), nz(3)),
+        (nz(121), nz(9)),
+        (nz(999), nz(100)),
+        (NonZeroUsize::MAX, NonZeroUsize::MAX),
+      ];
+      for mask in 0..=u8::MAX {
+        let task = ImageAnalysisTask::new().with_extensions(
+          Extension::ALL
+            .into_iter()
+            .filter(|extension| mask & extension.bit() != 0),
+        );
+        assert_eq!(
+          task.prompt_template(),
+          ImageAnalysisTask::DEFAULT_PROMPT_TEMPLATE
+        );
+        assert_eq!(
+          task.prompt(),
+          prompt_0_6_0(&task),
+          "extensions {mask:#010b}"
+        );
+        for (description_max_chars, tags_max_items) in caps {
+          let task = task
+            .clone()
+            .with_description_max_chars(description_max_chars)
+            .with_tags_max_items(tags_max_items);
+          assert_eq!(
+            task.prompt(),
+            prompt_0_6_0(&task),
+            "extensions {mask:#010b}, caps {description_max_chars} and {tags_max_items}"
+          );
+        }
+      }
+    }
+
+    /// LAW: a custom template renders with the task's values in place of its
+    /// placeholders: each cap as its number; each extension's line and a
+    /// newline while the extension is on, and nothing while it is off;
+    /// `{extensions}` as every switched-on extension's line in field order;
+    /// each placeholder wherever it stands, as often as it stands.
+    #[test]
+    fn a_custom_template_renders_the_task_values_in_place() {
+      let template = "caps {description_max_chars} and {tags_max_items}\n\
+                      {categories}{subjects}{scene}[{extensions}]\n\
+                      {tags_max_items} again";
+      let task = ImageAnalysisTask::new()
+        .with_extensions([Extension::Categories, Extension::Scene, Extension::Lighting])
+        .with_description_max_chars(nz(40))
+        .with_tags_max_items(nz(3))
+        .with_prompt_template(template)
+        .expect("a template");
+      assert_eq!(task.prompt_template(), template);
+      let mut expected = String::from("caps 40 and 3\n");
+      expected += &line(Extension::Categories);
+      expected += &line(Extension::Scene);
+      expected.push('[');
+      for extension in [Extension::Scene, Extension::Lighting, Extension::Categories] {
+        expected += &line(extension);
+      }
+      expected += "]\n3 again";
+      assert_eq!(task.prompt(), expected);
+    }
+
+    /// LAW: under a custom template the prompt follows the caps and the
+    /// extensions as it does under the default one: every setter that
+    /// rebuilds the schema renders the prompt again, and the template stays
+    /// as it was set.
+    #[test]
+    fn a_custom_template_follows_the_caps_and_the_extensions() {
+      let template =
+        "{extensions}at most {description_max_chars} characters, {tags_max_items} tags";
+      let task = ImageAnalysisTask::new()
+        .with_prompt_template(template)
+        .expect("a template");
+      assert_eq!(task.prompt(), "at most 120 characters, 8 tags");
+
+      let task = task.with_description_max_chars(nz(40));
+      assert_eq!(task.prompt(), "at most 40 characters, 8 tags");
+      let mut task = task.with_tags_max_items(nz(3));
+      assert_eq!(task.prompt(), "at most 40 characters, 3 tags");
+
+      task
+        .set_description_max_chars(nz(7))
+        .set_tags_max_items(nz(2))
+        .set_extensions([Extension::Emotion]);
+      let expected = format!("{}at most 7 characters, 2 tags", line(Extension::Emotion));
+      assert_eq!(task.prompt(), expected);
+      // No placeholder renders a list extension's cap: setting one leaves
+      // the prompt as it was.
+      task.set_max_items(Extension::Emotion, nz(1));
+      assert_eq!(task.prompt(), expected);
+      assert_eq!(task.prompt_template(), template);
+
+      // The default template, set again, renders the default prompt.
+      task
+        .set_prompt_template(ImageAnalysisTask::DEFAULT_PROMPT_TEMPLATE)
+        .expect("the default is a template");
+      assert_eq!(task.prompt(), prompt_0_6_0(&task));
+    }
+
+    /// LAW: a doubled brace is one literal brace, so a template can show the
+    /// model a JSON object. `{{scene}}` is the text `{scene}`, not a
+    /// placeholder, and `{{{scene}}}` is the placeholder between literal
+    /// braces.
+    #[test]
+    fn a_doubled_brace_is_one_literal_brace() {
+      let task = ImageAnalysisTask::new().with_extensions([Extension::Scene]);
+      for (template, prompt) in [
+        (
+          r#"Answer as {{"tags": [...]}}."#,
+          r#"Answer as {"tags": [...]}."#,
+        ),
+        ("{{scene}}", "{scene}"),
+        ("{{", "{"),
+        ("}}", "}"),
+        ("}}{{", "}{"),
+        ("{{{tags_max_items}}}", "{8}"),
+      ] {
+        let task = task
+          .clone()
+          .with_prompt_template(template)
+          .unwrap_or_else(|err| panic!("{template:?} is a template: {err}"));
+        assert_eq!(task.prompt(), prompt, "{template:?}");
+      }
+      let task = task
+        .with_prompt_template("{{{scene}}}")
+        .expect("a template");
+      assert_eq!(task.prompt(), format!("{{{}}}", line(Extension::Scene)));
+    }
+
+    /// LAW: a text that is no template is refused by name, at the setter:
+    /// one that is empty or only whitespace as `Empty`; a placeholder outside
+    /// the table as `UnknownPlaceholder`, naming it exactly as written; a
+    /// brace that is neither part of a placeholder nor doubled as
+    /// `UnbalancedBrace`, naming the brace and its byte offset. The first
+    /// fault in the text is the one named.
+    #[test]
+    fn a_text_that_is_no_template_is_refused_by_name() {
+      let refusal = |template: &str| match ImageAnalysisTask::new().with_prompt_template(template) {
+        Err(err) => err,
+        Ok(_) => panic!("{template:?} must be refused"),
+      };
+      for blank in ["", " ", "\n\t \n"] {
+        assert_eq!(refusal(blank), InvalidTemplate::Empty, "{blank:?}");
+      }
+      for (template, name) in [
+        (
+          "at most {description_max_char} characters",
+          "description_max_char",
+        ),
+        ("{Scene}", "Scene"),
+        ("{ scene }", " scene "),
+        ("{}", ""),
+        // Every task asks for `description` and `tags`: their lines are the
+        // template's own text, not placeholders.
+        ("{description}", "description"),
+        ("{tags}", "tags"),
+        // A JSON object in single braces reads as a placeholder.
+        (r#"Answer as {"tags": []}."#, r#""tags": []"#),
+        ("{nope} {", "nope"),
+      ] {
+        assert_eq!(
+          refusal(template),
+          InvalidTemplate::UnknownPlaceholder {
+            name: SmolStr::new(name)
+          },
+          "{template:?}"
+        );
+      }
+      for (template, brace, offset) in [
+        ("tags: {tags_max_items", '{', 6),
+        ("{", '{', 0),
+        ("a {scene {tags_max_items}", '{', 2),
+        ("}", '}', 0),
+        ("{scene}}", '}', 7),
+        ("{{}", '}', 2),
+        // The offset counts bytes: `é` is two.
+        ("é}", '}', 2),
+        ("} {nope}", '}', 0),
+      ] {
+        assert_eq!(
+          refusal(template),
+          InvalidTemplate::UnbalancedBrace { brace, offset },
+          "{template:?}"
+        );
+      }
+    }
+
+    /// A refused template leaves the task as it was: its template and its
+    /// prompt.
+    #[test]
+    fn a_refused_template_leaves_the_task_as_it_was() {
+      let template = "{scene}tags: at most {tags_max_items}";
+      let mut task = ImageAnalysisTask::new()
+        .with_extensions([Extension::Scene])
+        .with_prompt_template(template)
+        .expect("a template");
+      let prompt = String::from(task.prompt());
+      for refused in ["", "{nope}", "{"] {
+        assert!(task.set_prompt_template(refused).is_err(), "{refused:?}");
+        assert_eq!(task.prompt_template(), template);
+        assert_eq!(task.prompt(), prompt);
+      }
+    }
+
+    /// `InvalidTemplate`'s message names the fault: the unknown placeholder
+    /// with every name a placeholder may hold, or the unbalanced brace and
+    /// where it stands.
+    #[test]
+    fn an_invalid_template_message_names_the_fault() {
+      let unknown = InvalidTemplate::UnknownPlaceholder {
+        name: SmolStr::new("descripton_max_chars"),
+      };
+      assert_eq!(
+        format!("{unknown}"),
+        "unknown prompt-template placeholder \"descripton_max_chars\": expected one of \
+         {description_max_chars}, {tags_max_items}, {extensions}, {scene}, {subjects}, \
+         {objects}, {actions}, {emotion}, {shot_type}, {lighting}, {categories}; a literal \
+         brace is written {{ or }}"
+      );
+      assert_eq!(
+        format!(
+          "{}",
+          InvalidTemplate::UnbalancedBrace {
+            brace: '}',
+            offset: 7
+          }
+        ),
+        "unbalanced '}' at byte 7 of the prompt template: a placeholder is written {name}, \
+         and a literal brace {{ or }}"
+      );
+      assert_eq!(
+        format!("{}", InvalidTemplate::Empty),
+        "the prompt template is empty"
+      );
+    }
+
+    /// Every extension has its placeholder, spelled as the extension's name,
+    /// and no two placeholders share a name.
+    #[test]
+    fn every_extension_has_its_placeholder() {
+      for extension in Extension::ALL {
+        assert_eq!(
+          Placeholder::from_name(extension.as_str()),
+          Some(Placeholder::Extension(extension))
+        );
+      }
+      for (index, placeholder) in Placeholder::ALL.into_iter().enumerate() {
+        assert_eq!(
+          Placeholder::from_name(placeholder.name()),
+          Some(placeholder)
+        );
+        assert!(
+          Placeholder::ALL[..index]
+            .iter()
+            .all(|earlier| earlier.name() != placeholder.name()),
+          "{placeholder:?}'s name is taken"
+        );
+      }
+    }
+
+    /// LAW: the template words the prompt and nothing else. The schema, the
+    /// field caps and `parse` are the same under any template, and a
+    /// template that leaves out every extension's line still has the schema
+    /// require every switched-on field.
+    #[test]
+    fn the_template_changes_the_prompt_and_nothing_else() {
+      let default = full_task();
+      let custom = full_task()
+        .with_prompt_template("Describe the picture.")
+        .expect("a template");
+      assert_eq!(custom.prompt(), "Describe the picture.");
+      assert_eq!(custom.schema(), default.schema());
+      assert_eq!(custom.field_caps(), default.field_caps());
+      let answer = r#"{"scene":"beach","description":"Sunset over the ocean","subjects":["person"],"objects":["sun"],"actions":["watching"],"emotion":["calm"],"shot_type":"wide shot","lighting":["golden hour"],"tags":["sunset","ocean"],"categories":["nature"]}"#;
+      assert_eq!(
+        custom.parse(answer).expect("the answer parses"),
+        default.parse(answer).expect("the answer parses")
+      );
+      match custom.parse(r#"{"description":"Sunset","tags":["sunset"]}"#) {
+        Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields.len(), 8),
+        other => panic!("expected MissingFields naming the eight extensions, got {other:?}"),
+      }
     }
 
     /// A description over its cap is refused by name, as a missing field

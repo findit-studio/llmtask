@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-14
+
+### Added
+- The `ImageAnalysisTask` prompt is a template a deployment can reword:
+  `with_prompt_template(template)` / `set_prompt_template(template)` and
+  `prompt_template()`, and `ImageAnalysisTask::DEFAULT_PROMPT_TEMPLATE`, the
+  template every task starts with. A template is text with named
+  placeholders, rendered again by every setter that rebuilds the schema:
+  `{description_max_chars}` and `{tags_max_items}` render the caps; an
+  extension's name (`{scene}`, `{subjects}`, `{objects}`, `{actions}`,
+  `{emotion}`, `{shot_type}`, `{lighting}`, `{categories}`) renders the line
+  that describes its field and a newline while the extension is on, and
+  nothing while it is off; `{extensions}` renders every switched-on
+  extension's line, in field order; `{{` and `}}` write a literal brace. The
+  default template renders the 0.6.0 prompt byte for byte for every roster
+  and cap, so `Task::prompt()` is unchanged for a task that sets no template.
+  A task that sets one has a new `prompt()`, so a consumer that folds the
+  prompt into a derivation identity derives anew. The schema and `parse` do
+  not read the template.
+- `InvalidTemplate`, in `llmtask::image_analysis` beside `UnknownExtension`:
+  the template setters refuse, by name, a template that is empty or only
+  whitespace (`Empty`), names a placeholder outside that list
+  (`UnknownPlaceholder { name }`, whose message lists the known ones), or has
+  a brace that is neither part of a placeholder nor doubled
+  (`UnbalancedBrace { brace, offset }`). A refused template leaves the task as
+  it was.
+
 ## [0.6.0] - 2026-10-10
 
 `ImageAnalysis` changes its serialized layout, and `ImageAnalysisTask` caps

@@ -28,6 +28,12 @@
   a brace that is neither part of a placeholder nor doubled
   (`UnbalancedBrace { brace, offset }`). A refused template leaves the task as
   it was.
+- `ImageAnalysisTask::PROMPT_MAX_BYTES` (64 KiB): a template is measured at
+  its widest rendering, with every extension on and both caps at the widest
+  number a `NonZeroUsize` writes, and one longer than the bound is refused as
+  `InvalidTemplate::TooLong { widest, max }`, so a template that is accepted
+  renders within the bound after any later setter. The default template
+  renders at most 1,583 bytes.
 
 ## [0.6.0] - 2026-10-10
 

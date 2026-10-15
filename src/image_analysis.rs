@@ -1313,7 +1313,9 @@ mod image_analysis_task {
   /// The error [`ImageAnalysisTask::with_prompt_template`] and
   /// [`ImageAnalysisTask::set_prompt_template`] return for a text that is not
   /// a prompt template, named for what is wrong with it. A template is read
-  /// from its start, and the first fault in it is the one named.
+  /// from its start, and the first fault in it is the one named; a template
+  /// with no fault in its text is then measured at its widest rendering
+  /// against [`ImageAnalysisTask::PROMPT_MAX_BYTES`].
   #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
   pub enum InvalidTemplate {
     /// The template is empty or holds only whitespace: it would tell the
@@ -1343,6 +1345,34 @@ mod image_analysis_task {
       /// The brace's byte offset in the template.
       offset: usize,
     },
+    /// The template's widest rendering, the one it renders with every
+    /// extension on and both caps at the widest number a `NonZeroUsize`
+    /// writes, is longer than [`ImageAnalysisTask::PROMPT_MAX_BYTES`], or
+    /// room for it could not be reserved. Refused here, it can never reach
+    /// the setters that cannot fail.
+    #[error(
+      "the prompt template can render up to {widest} bytes: more than a prompt may hold \
+       ({max}), or more than could be reserved"
+    )]
+    TooLong {
+      /// The most bytes the template renders in any state a task can reach;
+      /// `usize::MAX` when that count overflows.
+      widest: usize,
+      /// The most bytes a prompt may hold,
+      /// [`ImageAnalysisTask::PROMPT_MAX_BYTES`].
+      max: usize,
+    },
+  }
+
+  impl InvalidTemplate {
+    /// [`Self::TooLong`] for a template whose widest rendering is `widest`
+    /// bytes.
+    const fn too_long(widest: usize) -> Self {
+      Self::TooLong {
+        widest,
+        max: ImageAnalysisTask::PROMPT_MAX_BYTES,
+      }
+    }
   }
 
   /// A value a prompt template names between braces; see
@@ -1391,6 +1421,38 @@ mod image_analysis_task {
         .into_iter()
         .find(|placeholder| placeholder.name() == name)
     }
+
+    /// The most bytes a cap renders: the decimal digits of `usize::MAX`, the
+    /// widest number a `NonZeroUsize` writes.
+    const CAP_WIDEST: usize = {
+      let mut digits = 1;
+      let mut rest = usize::MAX;
+      while rest >= 10 {
+        rest /= 10;
+        digits += 1;
+      }
+      digits
+    };
+
+    /// The most bytes this placeholder renders in any state a task can
+    /// reach: a cap as [`Self::CAP_WIDEST`] digits, an extension's
+    /// placeholder as its line and newline, `{extensions}` as every
+    /// extension's line and newline.
+    const fn widest(self) -> usize {
+      match self {
+        Self::DescriptionMaxChars | Self::TagsMaxItems => Self::CAP_WIDEST,
+        Self::Extensions => {
+          let mut widest = 0;
+          let mut index = 0;
+          while index < Extension::ALL.len() {
+            widest += Self::Extension(Extension::ALL[index]).widest();
+            index += 1;
+          }
+          widest
+        }
+        Self::Extension(extension) => extension.prompt_line().len() + 1,
+      }
+    }
   }
 
   /// [`Placeholder::ALL`] as [`InvalidTemplate`]'s message lists them: each
@@ -1415,6 +1477,9 @@ mod image_analysis_task {
   struct PromptTemplate {
     text: SmolStr,
     pieces: Vec<Piece>,
+    // The most bytes the template renders in any state a task can reach; at
+    // most `ImageAnalysisTask::PROMPT_MAX_BYTES`.
+    widest: usize,
   }
 
   /// One piece of a [`PromptTemplate`].
@@ -1428,16 +1493,54 @@ mod image_analysis_task {
     Placeholder(Placeholder),
   }
 
+  impl Piece {
+    /// The most bytes this piece renders in any state a task can reach; at
+    /// least one.
+    fn widest(&self) -> usize {
+      match self {
+        Self::Text(range) => range.len(),
+        Self::Placeholder(placeholder) => placeholder.widest(),
+      }
+    }
+  }
+
   impl PromptTemplate {
-    /// Splits `text` into its pieces, or names the first fault that makes it
-    /// no template.
+    /// Splits `text` into its pieces, or names what makes it no template:
+    /// the first fault in its text, else a widest rendering longer than
+    /// [`ImageAnalysisTask::PROMPT_MAX_BYTES`].
+    ///
+    /// The template is measured before any of its pieces is stored, and
+    /// every piece renders at least one byte at its widest, so an accepted
+    /// template holds no more pieces than the bound has bytes.
     fn parse(text: SmolStr) -> Result<Self, InvalidTemplate> {
       if text.trim().is_empty() {
         return Err(InvalidTemplate::Empty);
       }
-      let source = text.as_str();
-      let bytes = source.as_bytes();
+      let mut widest = 0_usize;
+      let mut count = 0_usize;
+      Self::scan(&text, |piece| {
+        widest = widest.saturating_add(piece.widest());
+        count += 1;
+      })?;
+      if widest > ImageAnalysisTask::PROMPT_MAX_BYTES {
+        return Err(InvalidTemplate::too_long(widest));
+      }
       let mut pieces = Vec::new();
+      pieces
+        .try_reserve_exact(count)
+        .map_err(|_| InvalidTemplate::too_long(widest))?;
+      Self::scan(&text, |piece| pieces.push(piece))?;
+      Ok(Self {
+        text,
+        pieces,
+        widest,
+      })
+    }
+
+    /// Hands `each` the pieces of `source` in order, or returns the first
+    /// fault in it.
+    fn scan(source: &str, mut each: impl FnMut(Piece)) -> Result<(), InvalidTemplate> {
+      let bytes = source.as_bytes();
       // Where the text not yet in a piece starts.
       let mut start = 0;
       let mut index = 0;
@@ -1445,7 +1548,7 @@ mod image_analysis_task {
         match byte {
           // A doubled brace: the text up to and including its first brace.
           b'{' | b'}' if bytes.get(index + 1) == Some(&byte) => {
-            pieces.push(Piece::Text(start..index + 1));
+            each(Piece::Text(start..index + 1));
             index += 2;
             start = index;
           }
@@ -1466,9 +1569,9 @@ mod image_analysis_task {
                 name: SmolStr::new(name),
               })?;
             if start < index {
-              pieces.push(Piece::Text(start..index));
+              each(Piece::Text(start..index));
             }
-            pieces.push(Piece::Placeholder(placeholder));
+            each(Piece::Placeholder(placeholder));
             index = close + 1;
             start = index;
           }
@@ -1482,9 +1585,9 @@ mod image_analysis_task {
         }
       }
       if start < bytes.len() {
-        pieces.push(Piece::Text(start..bytes.len()));
+        each(Piece::Text(start..bytes.len()));
       }
-      Ok(Self { text, pieces })
+      Ok(())
     }
   }
 
@@ -1520,7 +1623,9 @@ mod image_analysis_task {
   /// describes exactly the roster's fields and states both caps; a
   /// deployment rewords the prompt with
   /// [`with_prompt_template`](Self::with_prompt_template), which changes the
-  /// prompt and nothing else.
+  /// prompt and nothing else. A template is held to
+  /// [`PROMPT_MAX_BYTES`](Self::PROMPT_MAX_BYTES) at its widest rendering,
+  /// so no setter renders a prompt past it.
   ///
   /// # The lists
   ///
@@ -1711,6 +1816,18 @@ Rules:
 - Use empty arrays or empty strings when a field is unknown.
 - Do not return markdown or any text outside the JSON object."#;
 
+    /// The most bytes a rendered prompt may hold: 64 KiB.
+    ///
+    /// A template is held to it at its widest rendering, the one it renders
+    /// with every extension on and both caps at the widest number a
+    /// `NonZeroUsize` writes: [`with_prompt_template`](Self::with_prompt_template)
+    /// refuses a template whose widest rendering is longer as
+    /// [`InvalidTemplate::TooLong`], so a template it accepts renders within
+    /// the bound whatever the extensions and the caps become.
+    /// [`Self::DEFAULT_PROMPT_TEMPLATE`] renders at most 1,583 bytes where
+    /// `usize` is 64 bits wide (1,563 where it is 32).
+    pub const PROMPT_MAX_BYTES: usize = 64 * 1024;
+
     /// [`Self::default_max_items`] of the lists that name one quality of the
     /// whole picture.
     const QUALITY_MAX_ITEMS: NonZeroUsize = NonZeroUsize::new(3).unwrap();
@@ -1754,7 +1871,7 @@ Rules:
         list_max_items: Extension::ALL.map(Self::default_max_items),
         accept_empty: false,
         template: PromptTemplate::parse(SmolStr::new_static(Self::DEFAULT_PROMPT_TEMPLATE))
-          .expect("DEFAULT_PROMPT_TEMPLATE names only known placeholders and balances its braces"),
+          .expect("DEFAULT_PROMPT_TEMPLATE is a template within PROMPT_MAX_BYTES"),
         schema: Value::Null,
         prompt: String::new(),
       };
@@ -1923,11 +2040,13 @@ Rules:
     /// [`InvalidTemplate`], naming the fault, for a template that is empty
     /// or only whitespace ([`Empty`](InvalidTemplate::Empty)), names a
     /// placeholder the table does not hold
-    /// ([`UnknownPlaceholder`](InvalidTemplate::UnknownPlaceholder)), or has
-    /// a brace that is neither part of a placeholder nor doubled
-    /// ([`UnbalancedBrace`](InvalidTemplate::UnbalancedBrace)). The task is
-    /// consumed either way; [`set_prompt_template`](Self::set_prompt_template)
-    /// keeps it as it was on a refusal.
+    /// ([`UnknownPlaceholder`](InvalidTemplate::UnknownPlaceholder)), has a
+    /// brace that is neither part of a placeholder nor doubled
+    /// ([`UnbalancedBrace`](InvalidTemplate::UnbalancedBrace)), or would
+    /// render more than [`Self::PROMPT_MAX_BYTES`] in some state the task can
+    /// reach ([`TooLong`](InvalidTemplate::TooLong)). The task is consumed
+    /// either way; [`set_prompt_template`](Self::set_prompt_template) keeps it
+    /// as it was on a refusal.
     ///
     /// # Example
     ///
@@ -1993,8 +2112,14 @@ Rules:
       &mut self,
       template: impl Into<SmolStr>,
     ) -> Result<&mut Self, InvalidTemplate> {
-      self.template = PromptTemplate::parse(template.into())?;
-      self.prompt = self.build_prompt();
+      let template = PromptTemplate::parse(template.into())?;
+      let mut prompt = String::new();
+      prompt
+        .try_reserve_exact(template.widest)
+        .map_err(|_| InvalidTemplate::too_long(template.widest))?;
+      self.render(&template, &mut prompt);
+      self.template = template;
+      self.prompt = prompt;
       Ok(self)
     }
 
@@ -2198,20 +2323,27 @@ Rules:
     }
 
     /// The prompt for the task: its template rendered for its extensions and
-    /// caps (see [`Self::with_prompt_template`]).
+    /// caps (see [`Self::with_prompt_template`]). The buffer is sized for the
+    /// template's widest rendering, which its setters held to
+    /// [`Self::PROMPT_MAX_BYTES`], so rendering never grows it.
     fn build_prompt(&self) -> String {
-      let text = self.template.text.as_str();
-      let mut prompt = String::with_capacity(text.len());
-      for piece in &self.template.pieces {
+      let mut prompt = String::with_capacity(self.template.widest);
+      self.render(&self.template, &mut prompt);
+      prompt
+    }
+
+    /// Writes `template` rendered for the task's extensions and caps.
+    fn render(&self, template: &PromptTemplate, prompt: &mut String) {
+      let text = template.text.as_str();
+      for piece in &template.pieces {
         match piece {
           Piece::Text(range) => prompt.push_str(&text[range.clone()]),
           // Writing into a `String` cannot fail.
           Piece::Placeholder(placeholder) => {
-            let _ = self.write_placeholder(&mut prompt, *placeholder);
+            let _ = self.write_placeholder(prompt, *placeholder);
           }
         }
       }
-      prompt
     }
 
     /// Writes the task's value for `placeholder`: a cap as its number; an
@@ -4683,6 +4815,22 @@ Rules:
           "{template:?}"
         );
       }
+      // A fault in the text is named before the template is measured, even
+      // one that follows a run of text longer than the bound.
+      let long = "x".repeat(ImageAnalysisTask::PROMPT_MAX_BYTES + 1);
+      assert_eq!(
+        refusal(&format!("{long}{{nope}}")),
+        InvalidTemplate::UnknownPlaceholder {
+          name: SmolStr::new("nope")
+        }
+      );
+      assert_eq!(
+        refusal(&format!("{long}}}")),
+        InvalidTemplate::UnbalancedBrace {
+          brace: '}',
+          offset: long.len()
+        }
+      );
     }
 
     /// A refused template leaves the task as it was: its template and its
@@ -4732,6 +4880,17 @@ Rules:
         format!("{}", InvalidTemplate::Empty),
         "the prompt template is empty"
       );
+      assert_eq!(
+        format!(
+          "{}",
+          InvalidTemplate::TooLong {
+            widest: 551_000_000,
+            max: 65_536
+          }
+        ),
+        "the prompt template can render up to 551000000 bytes: more than a prompt may hold \
+         (65536), or more than could be reserved"
+      );
     }
 
     /// Every extension has its placeholder, spelled as the extension's name,
@@ -4780,6 +4939,145 @@ Rules:
         Err(JsonParseError::MissingFields(fields)) => assert_eq!(fields.len(), 8),
         other => panic!("expected MissingFields naming the eight extensions, got {other:?}"),
       }
+    }
+
+    // ===== the prompt bound =====
+
+    /// The most bytes `{extensions}` renders: every extension's line and its
+    /// newline, as 0.6.0 wrote them.
+    fn every_line_len() -> usize {
+      EXTENSION_PARAGRAPHS
+        .into_iter()
+        .map(|(_, paragraph)| paragraph.len() + 1)
+        .sum()
+    }
+
+    /// The most bytes a cap renders: the digits of `usize::MAX`.
+    fn cap_digits() -> usize {
+      format!("{}", usize::MAX).len()
+    }
+
+    /// LAW: a template whose widest rendering passes the bound is refused by
+    /// name, with its widest rendering and the bound, at both setters and
+    /// whatever the task's extensions are now, and the refused template
+    /// leaves the task as it was. A million `{extensions}` is a 12 MB
+    /// template whose every placeholder renders 551 bytes with every
+    /// extension on.
+    #[test]
+    fn a_template_whose_widest_rendering_passes_the_bound_is_refused() {
+      assert_eq!(every_line_len(), 551);
+      let template = "{extensions}".repeat(1_000_000);
+      let refusal = InvalidTemplate::TooLong {
+        widest: 551_000_000,
+        max: ImageAnalysisTask::PROMPT_MAX_BYTES,
+      };
+      for extensions in [&[][..], &Extension::ALL[..]] {
+        let mut task = ImageAnalysisTask::new().with_extensions(extensions.iter().copied());
+        let prompt = String::from(task.prompt());
+        assert_eq!(
+          task.clone().with_prompt_template(template.as_str()).err(),
+          Some(refusal.clone()),
+          "extensions {extensions:?}"
+        );
+        assert_eq!(
+          task.set_prompt_template(template.as_str()).err(),
+          Some(refusal.clone()),
+          "extensions {extensions:?}"
+        );
+        assert_eq!(
+          task.prompt_template(),
+          ImageAnalysisTask::DEFAULT_PROMPT_TEMPLATE
+        );
+        assert_eq!(task.prompt(), prompt);
+      }
+    }
+
+    /// LAW: the bound is exact. A template whose widest rendering is exactly
+    /// `PROMPT_MAX_BYTES` is accepted and one a byte longer is refused,
+    /// counting each piece at its widest: a byte of text as one, a doubled
+    /// brace as the one brace it writes, a cap as the digits of `usize::MAX`,
+    /// an extension's placeholder as its line and newline. An accepted
+    /// template holds no more pieces than the bound has bytes.
+    #[test]
+    fn the_bound_admits_a_template_at_it_and_refuses_one_a_byte_over() {
+      let max = ImageAnalysisTask::PROMPT_MAX_BYTES;
+      let placeholders = "{description_max_chars}{tags_max_items}{scene}";
+      let fill = max - 2 * cap_digits() - line(Extension::Scene).len();
+      for (at_bound, over) in [
+        ("x".repeat(max), "x".repeat(max + 1)),
+        ("{{".repeat(max), format!("{}}}}}", "{{".repeat(max))),
+        (
+          format!("{placeholders}{}", "x".repeat(fill)),
+          format!("{placeholders}{}", "x".repeat(fill + 1)),
+        ),
+      ] {
+        let task = ImageAnalysisTask::new()
+          .with_prompt_template(at_bound.as_str())
+          .unwrap_or_else(|err| panic!("a template at the bound is accepted: {err}"));
+        assert_eq!(task.template.widest, max);
+        assert!(task.template.pieces.len() <= max);
+        assert_eq!(
+          ImageAnalysisTask::new()
+            .with_prompt_template(over.as_str())
+            .err(),
+          Some(InvalidTemplate::TooLong {
+            widest: max + 1,
+            max
+          })
+        );
+      }
+    }
+
+    /// LAW: a template accepted while every extension is off and the caps
+    /// are small renders within the bound after any later setter: switching
+    /// every extension on and both caps to their widest brings it to its
+    /// widest rendering, exactly the bound, and no further. A template that
+    /// fits the task as it stands, but would pass the bound in a state the
+    /// task can reach, is refused.
+    #[test]
+    fn an_accepted_template_renders_within_the_bound_after_any_setter() {
+      let max = ImageAnalysisTask::PROMPT_MAX_BYTES;
+      let fill = max - every_line_len() - 2 * cap_digits();
+      let at_bound = format!(
+        "{{extensions}}{{description_max_chars}}{{tags_max_items}}{}",
+        "x".repeat(fill)
+      );
+      let mut task = ImageAnalysisTask::new()
+        .with_prompt_template(at_bound.as_str())
+        .unwrap_or_else(|err| panic!("a template at the bound is accepted: {err}"));
+      // As it stands: every extension off, the caps at 120 and 8.
+      assert_eq!(task.prompt().len(), fill + "120".len() + "8".len());
+      task
+        .set_extensions(Extension::ALL)
+        .set_description_max_chars(NonZeroUsize::MAX)
+        .set_tags_max_items(NonZeroUsize::MAX);
+      assert_eq!(task.prompt().len(), max);
+
+      let over = format!("{at_bound}x");
+      assert_eq!(
+        ImageAnalysisTask::new()
+          .with_prompt_template(over.as_str())
+          .err(),
+        Some(InvalidTemplate::TooLong {
+          widest: max + 1,
+          max
+        })
+      );
+    }
+
+    /// LAW: the default template's widest rendering, the one it renders with
+    /// every extension on and both caps at their widest, is far below the
+    /// bound: 1,583 bytes where `usize` is 64 bits wide, as
+    /// `PROMPT_MAX_BYTES` states.
+    #[test]
+    fn the_default_template_renders_far_below_the_bound() {
+      let task = full_task()
+        .with_description_max_chars(NonZeroUsize::MAX)
+        .with_tags_max_items(NonZeroUsize::MAX);
+      assert_eq!(task.prompt().len(), task.template.widest);
+      assert!(32 * task.template.widest < ImageAnalysisTask::PROMPT_MAX_BYTES);
+      #[cfg(target_pointer_width = "64")]
+      assert_eq!(task.template.widest, 1_583);
     }
 
     /// A description over its cap is refused by name, as a missing field

@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [0.6.1] - 2026-10-14
+## [0.6.1] - 2026-10-15
 
 ### Added
 - The `ImageAnalysisTask` prompt is a template a deployment can reword:

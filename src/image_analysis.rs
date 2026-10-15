@@ -935,7 +935,7 @@ mod image_analysis_task {
   // Heap types under both std (resolves via the `extern crate std`) and
   // alloc-only (resolves via the `extern crate alloc as std` alias in
   // lib.rs).
-  use std::{collections::BTreeMap, string::String, vec::Vec};
+  use std::{borrow::Cow, collections::BTreeMap, string::String, vec::Vec};
 
   use super::{DescriptionEnd, ImageAnalysis, ListEnd};
   use crate::{
@@ -1325,13 +1325,18 @@ mod image_analysis_task {
     /// A placeholder names none of the values a template renders. The
     /// message lists every name a placeholder may hold.
     #[error(
-      "unknown prompt-template placeholder {name:?}: expected one of {known}; \
+      "unknown prompt-template placeholder {name:?}{}: expected one of {known}; \
        a literal brace is written {{{{ or }}}}",
+      cut_mark(.cut),
       known = PlaceholderList
     )]
     UnknownPlaceholder {
-      /// The text between the braces, exactly as written.
+      /// The text between the braces as written, or, when that is longer
+      /// than 64 bytes, as much of its start as fits in 64 bytes without
+      /// splitting a character.
       name: SmolStr,
+      /// Whether `name` is cut short of the text between the braces.
+      cut: bool,
     },
     /// A brace that is neither part of a placeholder nor doubled: a `{` that
     /// no `}` closes before the next brace, or a `}` that closes no `{`.
@@ -1365,6 +1370,10 @@ mod image_analysis_task {
   }
 
   impl InvalidTemplate {
+    /// The most bytes of an unknown placeholder's name that
+    /// [`Self::UnknownPlaceholder`] keeps.
+    const NAME_MAX_BYTES: usize = 64;
+
     /// [`Self::TooLong`] for a template whose widest rendering is `widest`
     /// bytes.
     const fn too_long(widest: usize) -> Self {
@@ -1373,6 +1382,26 @@ mod image_analysis_task {
         max: ImageAnalysisTask::PROMPT_MAX_BYTES,
       }
     }
+
+    /// [`Self::UnknownPlaceholder`] for the text `name` between a pair of
+    /// braces, kept to at most [`Self::NAME_MAX_BYTES`] bytes, so the error
+    /// costs no more than that however long the text is.
+    fn unknown_placeholder(name: &str) -> Self {
+      let mut end = name.len().min(Self::NAME_MAX_BYTES);
+      while !name.is_char_boundary(end) {
+        end -= 1;
+      }
+      Self::UnknownPlaceholder {
+        name: SmolStr::new(&name[..end]),
+        cut: end < name.len(),
+      }
+    }
+  }
+
+  /// What [`InvalidTemplate::UnknownPlaceholder`]'s message adds after the
+  /// name when the name is cut.
+  fn cut_mark(cut: &bool) -> &'static str {
+    if *cut { " (cut short)" } else { "" }
   }
 
   /// A value a prompt template names between braces; see
@@ -1471,11 +1500,18 @@ mod image_analysis_task {
     }
   }
 
-  /// A prompt template, split into the pieces it renders as when it is set,
-  /// so that rendering it cannot fail.
+  /// An accepted prompt template, stored compactly: its source, kept for
+  /// [`ImageAnalysisTask::prompt_template`], and the pieces it renders as, so
+  /// that rendering it cannot fail.
   #[derive(Clone)]
   struct PromptTemplate {
-    text: SmolStr,
+    // The template exactly as it was set: borrowed for the default template,
+    // copied for any other once it is accepted.
+    source: Cow<'static, str>,
+    // The text of every literal run, unescaped and in order: what the
+    // template writes as it stands. At most `widest` bytes.
+    literal: String,
+    // One piece per maximal literal run and one per placeholder.
     pieces: Vec<Piece>,
     // The most bytes the template renders in any state a task can reach; at
     // most `ImageAnalysisTask::PROMPT_MAX_BYTES`.
@@ -1483,72 +1519,133 @@ mod image_analysis_task {
   }
 
   /// One piece of a [`PromptTemplate`].
-  #[derive(Clone)]
+  #[derive(Debug, Clone, PartialEq, Eq)]
   enum Piece {
-    /// The template's text over this byte range, written as it stands. A
-    /// doubled brace is the one brace it stands for: its range ends after
-    /// the first of the two.
+    /// A maximal literal run: the template's literal text over this byte
+    /// range, written as it stands.
     Text(Range<usize>),
     /// A placeholder, written as the task's value for it.
     Placeholder(Placeholder),
   }
 
-  impl Piece {
-    /// The most bytes this piece renders in any state a task can reach; at
-    /// least one.
-    fn widest(&self) -> usize {
-      match self {
-        Self::Text(range) => range.len(),
-        Self::Placeholder(placeholder) => placeholder.widest(),
-      }
-    }
+  /// One step of a template's source, as [`PromptTemplate::scan`] reads it.
+  enum Step<'a> {
+    /// Text the template writes as it stands: a stretch of the source
+    /// without braces, then at most the one brace a doubled brace writes.
+    Text(&'a str),
+    /// A placeholder.
+    Placeholder(Placeholder),
+  }
+
+  /// What reading a template's source finds: the sizes its stored form
+  /// takes.
+  #[derive(Default)]
+  struct Measure {
+    // The most bytes the template renders in any state a task can reach;
+    // `usize::MAX` when that count overflows.
+    widest: usize,
+    // The bytes of literal text it writes as it stands.
+    literal: usize,
+    // Its pieces: one per maximal literal run and one per placeholder.
+    pieces: usize,
   }
 
   impl PromptTemplate {
-    /// Splits `text` into its pieces, or names what makes it no template:
-    /// the first fault in its text, else a widest rendering longer than
-    /// [`ImageAnalysisTask::PROMPT_MAX_BYTES`].
-    ///
-    /// The template is measured before any of its pieces is stored, and
-    /// every piece renders at least one byte at its widest, so an accepted
-    /// template holds no more pieces than the bound has bytes.
-    fn parse(text: SmolStr) -> Result<Self, InvalidTemplate> {
-      if text.trim().is_empty() {
+    /// The template `source` is, or what makes it none. `source` is read
+    /// borrowed, every refusal included, and only a template that passes is
+    /// copied and stored.
+    fn parse(source: &str) -> Result<Self, InvalidTemplate> {
+      let measure = Self::measure(source)?;
+      let mut copy = String::new();
+      copy
+        .try_reserve_exact(source.len())
+        .map_err(|_| InvalidTemplate::too_long(measure.widest))?;
+      copy.push_str(source);
+      Self::store(Cow::Owned(copy), &measure)
+    }
+
+    /// [`Self::parse`] for a `'static` template, which is kept borrowed.
+    fn parse_static(source: &'static str) -> Result<Self, InvalidTemplate> {
+      let measure = Self::measure(source)?;
+      Self::store(Cow::Borrowed(source), &measure)
+    }
+
+    /// Reads `source` borrowed: the first fault in its text, else its widest
+    /// rendering against [`ImageAnalysisTask::PROMPT_MAX_BYTES`]. It
+    /// allocates nothing but the bounded name of an unknown placeholder.
+    fn measure(source: &str) -> Result<Measure, InvalidTemplate> {
+      if source.trim().is_empty() {
         return Err(InvalidTemplate::Empty);
       }
-      let mut widest = 0_usize;
-      let mut count = 0_usize;
-      Self::scan(&text, |piece| {
-        widest = widest.saturating_add(piece.widest());
-        count += 1;
+      let mut measure = Measure::default();
+      let mut in_run = false;
+      Self::scan(source, |step| match step {
+        Step::Text(text) => {
+          measure.widest = measure.widest.saturating_add(text.len());
+          measure.literal += text.len();
+          if !in_run {
+            measure.pieces += 1;
+            in_run = true;
+          }
+        }
+        Step::Placeholder(placeholder) => {
+          measure.widest = measure.widest.saturating_add(placeholder.widest());
+          measure.pieces += 1;
+          in_run = false;
+        }
       })?;
-      if widest > ImageAnalysisTask::PROMPT_MAX_BYTES {
-        return Err(InvalidTemplate::too_long(widest));
+      if measure.widest > ImageAnalysisTask::PROMPT_MAX_BYTES {
+        return Err(InvalidTemplate::too_long(measure.widest));
       }
+      Ok(measure)
+    }
+
+    /// Stores an accepted template: `source` as it is, and its literal text
+    /// and pieces, reserved fallibly at the sizes `measure` found. Every
+    /// piece renders at least one byte at its widest, so the pieces number
+    /// no more than the bound has bytes.
+    fn store(source: Cow<'static, str>, measure: &Measure) -> Result<Self, InvalidTemplate> {
+      let too_long = || InvalidTemplate::too_long(measure.widest);
+      let mut literal = String::new();
+      literal
+        .try_reserve_exact(measure.literal)
+        .map_err(|_| too_long())?;
       let mut pieces = Vec::new();
       pieces
-        .try_reserve_exact(count)
-        .map_err(|_| InvalidTemplate::too_long(widest))?;
-      Self::scan(&text, |piece| pieces.push(piece))?;
+        .try_reserve_exact(measure.pieces)
+        .map_err(|_| too_long())?;
+      Self::scan(&source, |step| match step {
+        Step::Text(text) => {
+          let start = literal.len();
+          literal.push_str(text);
+          match pieces.last_mut() {
+            // Text after text continues the same literal run.
+            Some(Piece::Text(run)) => run.end = literal.len(),
+            _ => pieces.push(Piece::Text(start..literal.len())),
+          }
+        }
+        Step::Placeholder(placeholder) => pieces.push(Piece::Placeholder(placeholder)),
+      })?;
       Ok(Self {
-        text,
+        source,
+        literal,
         pieces,
-        widest,
+        widest: measure.widest,
       })
     }
 
-    /// Hands `each` the pieces of `source` in order, or returns the first
+    /// Hands `each` the steps of `source` in order, or returns the first
     /// fault in it.
-    fn scan(source: &str, mut each: impl FnMut(Piece)) -> Result<(), InvalidTemplate> {
+    fn scan(source: &str, mut each: impl FnMut(Step<'_>)) -> Result<(), InvalidTemplate> {
       let bytes = source.as_bytes();
-      // Where the text not yet in a piece starts.
+      // Where the text not yet in a step starts.
       let mut start = 0;
       let mut index = 0;
       while let Some(&byte) = bytes.get(index) {
         match byte {
           // A doubled brace: the text up to and including its first brace.
           b'{' | b'}' if bytes.get(index + 1) == Some(&byte) => {
-            each(Piece::Text(start..index + 1));
+            each(Step::Text(&source[start..index + 1]));
             index += 2;
             start = index;
           }
@@ -1564,14 +1661,12 @@ mod image_analysis_task {
                 offset: index,
               })?;
             let name = &source[index + 1..close];
-            let placeholder =
-              Placeholder::from_name(name).ok_or_else(|| InvalidTemplate::UnknownPlaceholder {
-                name: SmolStr::new(name),
-              })?;
+            let placeholder = Placeholder::from_name(name)
+              .ok_or_else(|| InvalidTemplate::unknown_placeholder(name))?;
             if start < index {
-              each(Piece::Text(start..index));
+              each(Step::Text(&source[start..index]));
             }
-            each(Piece::Placeholder(placeholder));
+            each(Step::Placeholder(placeholder));
             index = close + 1;
             start = index;
           }
@@ -1585,7 +1680,7 @@ mod image_analysis_task {
         }
       }
       if start < bytes.len() {
-        each(Piece::Text(start..bytes.len()));
+        each(Step::Text(&source[start..]));
       }
       Ok(())
     }
@@ -1823,7 +1918,9 @@ Rules:
     /// `NonZeroUsize` writes: [`with_prompt_template`](Self::with_prompt_template)
     /// refuses a template whose widest rendering is longer as
     /// [`InvalidTemplate::TooLong`], so a template it accepts renders within
-    /// the bound whatever the extensions and the caps become.
+    /// the bound whatever the extensions and the caps become. The template
+    /// is read borrowed and measured before any of it is copied, so a refusal
+    /// costs no memory in proportion to the template.
     /// [`Self::DEFAULT_PROMPT_TEMPLATE`] renders at most 1,583 bytes where
     /// `usize` is 64 bits wide (1,563 where it is 32).
     pub const PROMPT_MAX_BYTES: usize = 64 * 1024;
@@ -1870,7 +1967,7 @@ Rules:
         tags_max_items: Self::DEFAULT_TAGS_MAX_ITEMS,
         list_max_items: Extension::ALL.map(Self::default_max_items),
         accept_empty: false,
-        template: PromptTemplate::parse(SmolStr::new_static(Self::DEFAULT_PROMPT_TEMPLATE))
+        template: PromptTemplate::parse_static(Self::DEFAULT_PROMPT_TEMPLATE)
           .expect("DEFAULT_PROMPT_TEMPLATE is a template within PROMPT_MAX_BYTES"),
         schema: Value::Null,
         prompt: String::new(),
@@ -1997,7 +2094,7 @@ Rules:
     /// [`with_prompt_template`](Self::with_prompt_template) sets another.
     #[cfg_attr(not(tarpaulin), inline(always))]
     pub fn prompt_template(&self) -> &str {
-      &self.template.text
+      &self.template.source
     }
 
     /// Builder-style setter for the prompt template: the text the task's
@@ -2035,18 +2132,28 @@ Rules:
     /// of what it derives, such as a cache key or a derivation identity,
     /// derives anew under it.
     ///
+    /// The setters read `template` borrowed, every refusal included, so a
+    /// template they refuse is never copied. One they accept is copied once,
+    /// for [`prompt_template`](Self::prompt_template), and stored as its
+    /// literal text, unescaped, with one piece per run of that text and one
+    /// per placeholder; each of those, and the prompt, is reserved fallibly
+    /// and bounded by [`Self::PROMPT_MAX_BYTES`].
+    ///
     /// # Errors
     ///
     /// [`InvalidTemplate`], naming the fault, for a template that is empty
     /// or only whitespace ([`Empty`](InvalidTemplate::Empty)), names a
     /// placeholder the table does not hold
-    /// ([`UnknownPlaceholder`](InvalidTemplate::UnknownPlaceholder)), has a
+    /// ([`UnknownPlaceholder`](InvalidTemplate::UnknownPlaceholder), its name
+    /// kept to 64 bytes), has a
     /// brace that is neither part of a placeholder nor doubled
     /// ([`UnbalancedBrace`](InvalidTemplate::UnbalancedBrace)), or would
     /// render more than [`Self::PROMPT_MAX_BYTES`] in some state the task can
-    /// reach ([`TooLong`](InvalidTemplate::TooLong)). The task is consumed
-    /// either way; [`set_prompt_template`](Self::set_prompt_template) keeps it
-    /// as it was on a refusal.
+    /// reach ([`TooLong`](InvalidTemplate::TooLong)), which is also the
+    /// refusal when room to store an accepted template cannot be reserved.
+    /// The task is consumed either way;
+    /// [`set_prompt_template`](Self::set_prompt_template) keeps it as it was
+    /// on a refusal.
     ///
     /// # Example
     ///
@@ -2090,12 +2197,12 @@ Rules:
     ///   ImageAnalysisTask::new()
     ///     .with_prompt_template("at most {description_max_char} characters")
     ///     .err(),
-    ///   Some(InvalidTemplate::UnknownPlaceholder { name: "description_max_char".into() }),
+    ///   Some(InvalidTemplate::UnknownPlaceholder { name: "description_max_char".into(), cut: false }),
     /// );
     /// ```
     pub fn with_prompt_template(
       mut self,
-      template: impl Into<SmolStr>,
+      template: impl AsRef<str>,
     ) -> Result<Self, InvalidTemplate> {
       self.set_prompt_template(template)?;
       Ok(self)
@@ -2110,9 +2217,9 @@ Rules:
     /// task as it was, its template and its prompt included.
     pub fn set_prompt_template(
       &mut self,
-      template: impl Into<SmolStr>,
+      template: impl AsRef<str>,
     ) -> Result<&mut Self, InvalidTemplate> {
-      let template = PromptTemplate::parse(template.into())?;
+      let template = PromptTemplate::parse(template.as_ref())?;
       let mut prompt = String::new();
       prompt
         .try_reserve_exact(template.widest)
@@ -2334,10 +2441,9 @@ Rules:
 
     /// Writes `template` rendered for the task's extensions and caps.
     fn render(&self, template: &PromptTemplate, prompt: &mut String) {
-      let text = template.text.as_str();
       for piece in &template.pieces {
         match piece {
-          Piece::Text(range) => prompt.push_str(&text[range.clone()]),
+          Piece::Text(run) => prompt.push_str(&template.literal[run.clone()]),
           // Writing into a `String` cannot fail.
           Piece::Placeholder(placeholder) => {
             let _ = self.write_placeholder(prompt, *placeholder);
@@ -4793,7 +4899,8 @@ Rules:
         assert_eq!(
           refusal(template),
           InvalidTemplate::UnknownPlaceholder {
-            name: SmolStr::new(name)
+            name: SmolStr::new(name),
+            cut: false
           },
           "{template:?}"
         );
@@ -4821,7 +4928,8 @@ Rules:
       assert_eq!(
         refusal(&format!("{long}{{nope}}")),
         InvalidTemplate::UnknownPlaceholder {
-          name: SmolStr::new("nope")
+          name: SmolStr::new("nope"),
+          cut: false
         }
       );
       assert_eq!(
@@ -4857,6 +4965,7 @@ Rules:
     fn an_invalid_template_message_names_the_fault() {
       let unknown = InvalidTemplate::UnknownPlaceholder {
         name: SmolStr::new("descripton_max_chars"),
+        cut: false,
       };
       assert_eq!(
         format!("{unknown}"),
@@ -4864,6 +4973,14 @@ Rules:
          {description_max_chars}, {tags_max_items}, {extensions}, {scene}, {subjects}, \
          {objects}, {actions}, {emotion}, {shot_type}, {lighting}, {categories}; a literal \
          brace is written {{ or }}"
+      );
+      let cut = InvalidTemplate::UnknownPlaceholder {
+        name: SmolStr::new("nnnn"),
+        cut: true,
+      };
+      assert!(
+        format!("{cut}").starts_with("unknown prompt-template placeholder \"nnnn\" (cut short): "),
+        "{cut}"
       );
       assert_eq!(
         format!(
@@ -5078,6 +5195,87 @@ Rules:
       assert!(32 * task.template.widest < ImageAnalysisTask::PROMPT_MAX_BYTES);
       #[cfg(target_pointer_width = "64")]
       assert_eq!(task.template.widest, 1_583);
+    }
+
+    /// LAW: an accepted template is stored compactly: its literal text,
+    /// unescaped, in one buffer, with one piece per maximal literal run and
+    /// one per placeholder. A run of doubled braces is one piece, however
+    /// many braces it doubles.
+    #[test]
+    fn an_accepted_template_is_stored_compactly() {
+      let max = ImageAnalysisTask::PROMPT_MAX_BYTES;
+      let template = "{{".repeat(max);
+      let task = ImageAnalysisTask::new()
+        .with_prompt_template(template.as_str())
+        .unwrap_or_else(|err| panic!("a template at the bound is accepted: {err}"));
+      assert_eq!(task.template.pieces, [Piece::Text(0..max)]);
+      assert_eq!(task.template.literal, "{".repeat(max));
+      assert_eq!(task.prompt(), "{".repeat(max));
+      assert_eq!(task.prompt_template(), template);
+
+      let task = ImageAnalysisTask::new()
+        .with_extensions([Extension::Scene])
+        .with_prompt_template("a{{b}}c{scene}d{{")
+        .expect("a template");
+      assert_eq!(
+        task.template.pieces,
+        [
+          Piece::Text(0..5),
+          Piece::Placeholder(Placeholder::Extension(Extension::Scene)),
+          Piece::Text(5..7),
+        ]
+      );
+      assert_eq!(task.template.literal, "a{b}cd{");
+      assert_eq!(
+        task.prompt(),
+        format!("a{{b}}c{}d{{", line(Extension::Scene))
+      );
+
+      let task = ImageAnalysisTask::new()
+        .with_prompt_template("{tags_max_items}{description_max_chars}")
+        .expect("a template");
+      assert_eq!(
+        task.template.pieces,
+        [
+          Piece::Placeholder(Placeholder::TagsMaxItems),
+          Piece::Placeholder(Placeholder::DescriptionMaxChars),
+        ]
+      );
+      assert!(task.template.literal.is_empty());
+      assert_eq!(task.prompt(), "8120");
+    }
+
+    /// LAW: an unknown placeholder's name is kept to at most 64 bytes, cut
+    /// on a character boundary and marked as cut, so a refusal costs no more
+    /// than that however long the name is.
+    #[test]
+    fn an_unknown_placeholder_keeps_a_bounded_name() {
+      let refusal = |name: &str| {
+        ImageAnalysisTask::new()
+          .with_prompt_template(format!("{{{name}}}"))
+          .err()
+      };
+      for (name, kept, cut) in [
+        ("n".repeat(1 << 20), "n".repeat(64), true),
+        ("n".repeat(64), "n".repeat(64), false),
+        ("n".repeat(65), "n".repeat(64), true),
+        // `é` is two bytes: 31 of them after the `a` fill 63 of the 64.
+        (
+          format!("a{}", "é".repeat(100)),
+          format!("a{}", "é".repeat(31)),
+          true,
+        ),
+      ] {
+        assert_eq!(
+          refusal(&name),
+          Some(InvalidTemplate::UnknownPlaceholder {
+            name: SmolStr::new(&kept),
+            cut
+          }),
+          "a name of {} bytes",
+          name.len()
+        );
+      }
     }
 
     /// A description over its cap is refused by name, as a missing field

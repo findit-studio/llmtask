@@ -24,16 +24,21 @@
 - `InvalidTemplate`, in `llmtask::image_analysis` beside `UnknownExtension`:
   the template setters refuse, by name, a template that is empty or only
   whitespace (`Empty`), names a placeholder outside that list
-  (`UnknownPlaceholder { name }`, whose message lists the known ones), or has
-  a brace that is neither part of a placeholder nor doubled
-  (`UnbalancedBrace { brace, offset }`). A refused template leaves the task as
-  it was.
+  (`UnknownPlaceholder { name, cut }`, whose message lists the known ones;
+  `name` keeps at most 64 bytes of the text between the braces, cut on a
+  character boundary, and `cut` marks it), or has a brace that is neither part
+  of a placeholder nor doubled (`UnbalancedBrace { brace, offset }`). A
+  refused template leaves the task as it was.
 - `ImageAnalysisTask::PROMPT_MAX_BYTES` (64 KiB): a template is measured at
   its widest rendering, with every extension on and both caps at the widest
   number a `NonZeroUsize` writes, and one longer than the bound is refused as
   `InvalidTemplate::TooLong { widest, max }`, so a template that is accepted
-  renders within the bound after any later setter. The default template
-  renders at most 1,583 bytes.
+  renders within the bound after any later setter. The setters take the
+  template as `impl AsRef<str>` and read it borrowed, every refusal included,
+  so a template they refuse is never copied; an accepted one is copied once
+  and stored as its unescaped literal text with one piece per literal run and
+  per placeholder, each reserved fallibly and bounded by the limit. The
+  default template renders at most 1,583 bytes.
 
 ## [0.6.0] - 2026-10-10
 
